@@ -1,49 +1,44 @@
-# project_x_full_upgraded.py
-# Upgraded single-file Streamlit app: fixes login/navigation + scheduler + estimates + customer portal + auto-followups + perf polish
-# Requirements: streamlit, pandas, sqlalchemy, plotly (optional), fpdf (optional)
-# Run: streamlit run project_x_full_upgraded.py
+# project_x_stable.py
+# Stable single-file Streamlit app for Restoration Pipeline (robust, defensive)
+# Features: login, pipeline KPIs, top-5 priority, SLA alerts, leads CRUD, CPA/ROI, settings, users, export
+# Run: streamlit run project_x_stable.py
 
 import os
-import time
-from datetime import datetime, timedelta, date
-import io
-import random
+from datetime import datetime, timedelta, date, time
 import traceback
 
 import streamlit as st
 import pandas as pd
+import matplotlib.pyplot as plt
 
-# Optional libs
+# plotly optional
 try:
     import plotly.express as px
 except Exception:
     px = None
 
-try:
-    from fpdf import FPDF
-    FPDF_AVAILABLE = True
-except Exception:
-    FPDF_AVAILABLE = False
+# SQLAlchemy
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+)
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Database (SQLAlchemy)
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
-from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
+# ----- Config -----
+DB_FILE = os.path.join(os.getcwd(), "project_x_stable.db")
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-BASE_DIR = os.getcwd()
-DB_FILE = os.path.join(BASE_DIR, "project_x_upgraded.db")
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
+# ----- Database setup -----
+# expire_on_commit=False prevents detached instances
 engine = create_engine(f"sqlite:///{DB_FILE}", connect_args={"check_same_thread": False})
-SessionLocal = scoped_session(sessionmaker(bind=engine, expire_on_commit=False))
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
-# -----------------------
-# Models
-# -----------------------
+
+# ----- Models -----
 class Lead(Base):
     __tablename__ = "leads"
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     source = Column(String, default="Website")
     source_details = Column(String, nullable=True)
     contact_name = Column(String, nullable=True)
@@ -70,7 +65,9 @@ class Lead(Base):
     lost_comment = Column(Text, nullable=True)
     qualified = Column(Boolean, default=False)
     cost_to_acquire = Column(Float, default=0.0)
-    owner = Column(String, default="")  # user assigned
+    owner = Column(String, default=None)
+    priority_score = Column(Float, default=0.0)
+
 
 class User(Base):
     __tablename__ = "users"
@@ -79,9 +76,10 @@ class User(Base):
     role = Column(String, default="Viewer")
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
 class LeadHistory(Base):
     __tablename__ = "lead_history"
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     lead_id = Column(Integer)
     updated_by = Column(String)
     update_time = Column(DateTime, default=datetime.utcnow)
@@ -89,75 +87,97 @@ class LeadHistory(Base):
     new_status = Column(String)
     note = Column(Text)
 
-Base.metadata.create_all(bind=engine)
 
-# -----------------------
-# Utilities
-# -----------------------
+Base.metadata.create_all(engine)
+
+
+# ----- Utilities -----
 def get_session():
     return SessionLocal()
 
-def save_file(uploaded, prefix="file"):
-    if uploaded is None:
-        return None
-    name = f"{prefix}_{int(datetime.utcnow().timestamp())}_{uploaded.name}"
-    path = os.path.join(UPLOAD_FOLDER, name)
-    with open(path, "wb") as f:
-        f.write(uploaded.getbuffer())
-    return path
 
-@st.cache_data(ttl=30)
-def cached_leads(start_date=None, end_date=None):
+def row_to_dict(lead_row):
+    # convert SQLAlchemy object to plain dict safely
+    return {
+        "id": lead_row.id,
+        "source": lead_row.source,
+        "source_details": lead_row.source_details,
+        "contact_name": lead_row.contact_name,
+        "contact_phone": lead_row.contact_phone,
+        "contact_email": lead_row.contact_email,
+        "property_address": lead_row.property_address,
+        "damage_type": lead_row.damage_type,
+        "assigned_to": lead_row.assigned_to,
+        "notes": lead_row.notes,
+        "estimated_value": float(lead_row.estimated_value or 0.0),
+        "status": lead_row.status,
+        "created_at": lead_row.created_at,
+        "sla_hours": int(lead_row.sla_hours or 24),
+        "sla_entered_at": lead_row.sla_entered_at or lead_row.created_at,
+        "contacted": bool(lead_row.contacted),
+        "inspection_scheduled": bool(lead_row.inspection_scheduled),
+        "inspection_scheduled_at": lead_row.inspection_scheduled_at,
+        "inspection_completed": bool(lead_row.inspection_completed),
+        "estimate_submitted": bool(lead_row.estimate_submitted),
+        "awarded_date": lead_row.awarded_date,
+        "awarded_invoice": lead_row.awarded_invoice,
+        "lost_date": lead_row.lost_date,
+        "qualified": bool(lead_row.qualified),
+        "cost_to_acquire": float(lead_row.cost_to_acquire or 0.0),
+        "owner": lead_row.owner,
+        "priority_score": float(lead_row.priority_score or 0.0)
+    }
+
+
+def fetch_leads(start_date=None, end_date=None):
     s = get_session()
     try:
-        rows = s.query(Lead).order_by(Lead.created_at.desc()).all()
-        data = []
-        for r in rows:
-            data.append({
-                "id": r.id,
-                "source": r.source,
-                "source_details": r.source_details,
-                "contact_name": r.contact_name,
-                "contact_phone": r.contact_phone,
-                "contact_email": r.contact_email,
-                "property_address": r.property_address,
-                "damage_type": r.damage_type,
-                "assigned_to": r.assigned_to,
-                "notes": r.notes,
-                "estimated_value": float(r.estimated_value or 0.0),
-                "status": r.status,
-                "created_at": r.created_at,
-                "sla_hours": r.sla_hours,
-                "sla_entered_at": r.sla_entered_at or r.created_at,
-                "contacted": bool(r.contacted),
-                "inspection_scheduled": bool(r.inspection_scheduled),
-                "inspection_scheduled_at": r.inspection_scheduled_at,
-                "inspection_completed": bool(r.inspection_completed),
-                "estimate_submitted": bool(r.estimate_submitted),
-                "awarded_date": r.awarded_date,
-                "awarded_invoice": r.awarded_invoice,
-                "lost_date": r.lost_date,
-                "qualified": bool(r.qualified),
-                "cost_to_acquire": float(r.cost_to_acquire or 0.0),
-                "owner": r.owner or ""
-            })
-        df = pd.DataFrame(data)
+        q = s.query(Lead).order_by(Lead.created_at.desc())
+        rows = q.all()
+        dicts = [row_to_dict(r) for r in rows]
+        df = pd.DataFrame(dicts)
         if df.empty:
             return df
-        if start_date and end_date:
-            sdt = datetime.combine(start_date, datetime.min.time())
-            edt = datetime.combine(end_date, datetime.max.time())
-            df = df[(df["created_at"] >= sdt) & (df["created_at"] <= edt)].copy()
-        return df
+        if start_date:
+            start_dt = datetime.combine(start_date, datetime.min.time())
+            df = df[df["created_at"] >= start_dt]
+        if end_date:
+            end_dt = datetime.combine(end_date, datetime.max.time())
+            df = df[df["created_at"] <= end_dt]
+        return df.reset_index(drop=True)
     finally:
         s.close()
 
-def add_lead_to_db(payload):
+
+@st.cache_data(ttl=30)
+def get_leads_df_cached(start_date=None, end_date=None):
+    # caching wrapper
+    return fetch_leads(start_date, end_date)
+
+
+def add_lead(payload: dict):
     s = get_session()
     try:
-        lead = Lead(**payload)
+        lead = Lead(
+            source=payload.get("source"),
+            source_details=payload.get("source_details"),
+            contact_name=payload.get("contact_name"),
+            contact_phone=payload.get("contact_phone"),
+            contact_email=payload.get("contact_email"),
+            property_address=payload.get("property_address"),
+            damage_type=payload.get("damage_type"),
+            assigned_to=payload.get("assigned_to"),
+            notes=payload.get("notes"),
+            estimated_value=payload.get("estimated_value") or 0.0,
+            sla_hours=int(payload.get("sla_hours") or 24),
+            sla_entered_at=payload.get("sla_entered_at") or datetime.utcnow(),
+            qualified=bool(payload.get("qualified")),
+            cost_to_acquire=float(payload.get("cost_to_acquire") or 0.0),
+            owner=payload.get("owner") or None
+        )
         s.add(lead)
         s.commit()
+        s.refresh(lead)
         return lead.id
     except Exception:
         s.rollback()
@@ -165,7 +185,8 @@ def add_lead_to_db(payload):
     finally:
         s.close()
 
-def update_lead_db(lead_id, updates, actor=None, note=None):
+
+def update_lead(lead_id: int, updates: dict, actor: str = None, note: str = None):
     s = get_session()
     try:
         lead = s.query(Lead).filter(Lead.id == lead_id).first()
@@ -173,9 +194,19 @@ def update_lead_db(lead_id, updates, actor=None, note=None):
             return False
         old_status = lead.status
         for k, v in updates.items():
-            setattr(lead, k, v)
+            if hasattr(lead, k):
+                setattr(lead, k, v)
+        # write history
+        h = LeadHistory(
+            lead_id=lead_id,
+            updated_by=actor or "",
+            update_time=datetime.utcnow(),
+            old_status=old_status,
+            new_status=lead.status,
+            note=note or ""
+        )
+        s.add(h)
         s.add(lead)
-        s.add(LeadHistory(lead_id=lead_id, updated_by=actor or "", old_status=old_status, new_status=lead.status, note=note or ""))
         s.commit()
         return True
     except Exception:
@@ -184,547 +215,494 @@ def update_lead_db(lead_id, updates, actor=None, note=None):
     finally:
         s.close()
 
-def compute_sla_remaining(entered, hours):
-    if entered is None:
-        entered = datetime.utcnow()
-    if isinstance(entered, str):
-        try:
-            entered = datetime.fromisoformat(entered)
-        except:
-            entered = datetime.utcnow()
-    deadline = entered + timedelta(hours=int(hours or 24))
-    rem = deadline - datetime.utcnow()
-    return rem.total_seconds(), rem.total_seconds() <= 0
 
-# -----------------------
-# UI Styling and header
-# -----------------------
-st.set_page_config(page_title="Project X — Pro", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
+def compute_remaining_sla_seconds(sla_entered_at, sla_hours):
+    try:
+        if sla_entered_at is None:
+            sla_entered_at = datetime.utcnow()
+        if isinstance(sla_entered_at, str):
+            sla_entered_at = datetime.fromisoformat(sla_entered_at)
+        deadline = sla_entered_at + timedelta(hours=int(sla_hours or 24))
+        remaining = deadline - datetime.utcnow()
+        return max(remaining.total_seconds(), 0), (remaining.total_seconds() <= 0)
+    except Exception:
+        return float("inf"), False
+
+
+def compute_priority(lead_row: dict, weights=None):
+    if weights is None:
+        weights = {"value_weight": 0.6, "sla_weight": 0.4, "value_baseline": 5000.0}
+    try:
+        val = float(lead_row.get("estimated_value") or 0.0)
+        vscore = min(1.0, val / max(1.0, weights.get("value_baseline", 5000.0)))
+    except Exception:
+        vscore = 0.0
+    sla_entered = lead_row.get("sla_entered_at") or lead_row.get("created_at")
+    try:
+        if isinstance(sla_entered, str):
+            sla_entered = datetime.fromisoformat(sla_entered)
+        deadline = sla_entered + timedelta(hours=int(lead_row.get("sla_hours") or 24))
+        time_left_h = max((deadline - datetime.utcnow()).total_seconds() / 3600.0, 0.0)
+    except Exception:
+        time_left_h = 9999.0
+    sla_score = max(0.0, (72.0 - min(time_left_h, 72.0)) / 72.0)
+    score = vscore * weights["value_weight"] + sla_score * weights["sla_weight"]
+    return max(0.0, min(1.0, score))
+
+
+# ----- UI / App -----
+st.set_page_config(page_title="Project X — Stable", layout="wide")
+
+# CSS
+APP_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Comfortaa:wght@300;400;700&display=swap');
-body, .stApp { font-family: 'Comfortaa', sans-serif; background: #ffffff; }
-.header {
-  display:flex; align-items:center; justify-content:space-between;
-  padding:10px 18px; border-bottom:1px solid #f0f0f0;
-}
-.brand { font-weight:800; font-size:20px; color:#0b1220; }
-.subtle { color:#6b7280; font-size:13px; }
-.kpi-card { background:#000; color:#fff; padding:12px; border-radius:10px; min-height:96px; }
-.kpi-title { font-size:12px; color:#fff; font-weight:700; }
-.kpi-value { font-size:22px; font-weight:900; margin-top:6px; }
-.progress-wrap{ background:#111; height:8px; border-radius:8px; margin-top:8px; overflow:hidden; }
-.progress-fill{ height:100%; transition:width .4s ease; }
-.topbar { display:flex; gap:10px; align-items:center; }
-.button-like { background:#000;color:#fff;padding:8px 12px;border-radius:8px; cursor:pointer; }
-.small-muted{ color:#6b7280; font-size:12px; }
+body, .stApp { font-family: 'Comfortaa', sans-serif; background: #ffffff; color: #0b1220; }
+.header { display:flex; justify-content:space-between; align-items:center; padding:12px 6px; border-bottom:1px solid #eee; }
+.brand { font-weight:800; font-size:20px; }
+.small { color:#6b7280; font-size:13px; }
+.kpi { background:#000; color:#fff; padding:12px; border-radius:10px; margin:6px; }
+.kpi .title { color:white; font-weight:700; font-size:13px; }
+.kpi .value { font-weight:900; font-size:20px; margin-top:6px; }
+.progress { height:8px; border-radius:6px; margin-top:8px; }
+.lead-card { border-radius:10px; padding:10px; border:1px solid #eef2f7; margin-bottom:8px; }
+.badge { background:#ef4444; color:#fff; padding:6px 10px; border-radius:8px; font-weight:700; cursor:pointer; }
+.small-muted { color:#6b7280; font-size:12px; }
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
-# -----------------------
-# LOGIN (fixes the earlier issue)
-# -----------------------
-if "user" not in st.session_state:
-    st.session_state.user = None
-    st.session_state.role = None
+# Header
+col1, col2 = st.columns([3, 1])
+with col1:
+    st.markdown("<div class='header'><div><div class='brand'>Project X — Pipeline (Stable)</div><div class='small'>Sales & lead pipeline — SLA & CPA</div></div></div>", unsafe_allow_html=True)
+with col2:
+    # lightweight alert badge
+    if "alerts_open" not in st.session_state:
+        st.session_state.alerts_open = False
 
-# Simple login UI in the sidebar
+    # lazy compute overdue count
+    try:
+        df_tmp = get_leads_df_cached(None, None)
+        overdue_count = int(df_tmp[(df_tmp["status"].str.lower() == "overdue")].shape[0]) if not df_tmp.empty else 0
+    except Exception:
+        overdue_count = 0
+
+    if overdue_count:
+        if st.button(f"🔔 {overdue_count}"):
+            st.session_state.alerts_open = not st.session_state.alerts_open
+    else:
+        st.markdown("<div class='small-muted'>No SLA alerts</div>", unsafe_allow_html=True)
+
+# Sidebar: login & navigation & quick controls
 with st.sidebar:
     st.markdown("## Account")
-    username = st.text_input("Username", value=st.session_state.user or "")
+    user_name = st.text_input("Username", value=st.session_state.get("user", ""))
     if st.button("Login"):
-        if username.strip() == "":
-            st.warning("Enter a username")
+        if user_name.strip() == "":
+            st.warning("Please enter a username")
         else:
-            # create or fetch user
+            # create user if not exists
             s = get_session()
             try:
-                u = s.query(User).filter(User.username == username).first()
+                u = s.query(User).filter(User.username == user_name).first()
                 if not u:
-                    u = User(username=username, full_name=username, role="Admin" if username.lower() == "admin" else "Viewer")
+                    u = User(username=user_name, full_name=user_name, role="Admin" if user_name.lower() == "admin" else "Viewer")
                     s.add(u); s.commit()
                 st.session_state.user = u.username
                 st.session_state.role = u.role
-                st.session_state.full_name = u.full_name or u.username
-                # refresh UI so main app appears immediately
-                st.experimental_rerun()
+                st.success(f"Signed in as {st.session_state.user} ({st.session_state.role})")
             finally:
                 s.close()
-    if st.session_state.user:
-        st.markdown(f"Signed in as **{st.session_state.user}**  \nRole: *{st.session_state.role or 'Viewer'}*")
+
+    if st.session_state.get("user"):
+        st.markdown(f"Signed in as **{st.session_state.user}**")
         if st.button("Logout"):
             st.session_state.clear()
-            st.experimental_rerun()
+            st.experimental_rerun()  # safe here, after clearing state we'll rerun to login prompt
 
-# block before login
-if not st.session_state.user:
-    st.markdown("<div style='padding:18px'><h2>Welcome — please sign in</h2><p class='small-muted'>Use any username (e.g. 'AyoBami'). We'll create a profile for you.</p></div>", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("## Navigation")
+    page = st.radio("Go to", ["Pipeline Board", "Leads / Capture", "Analytics & SLA", "CPA & ROI", "Settings", "Users", "Exports"], index=0)
+    st.session_state.page = page
+
+    st.markdown("---")
+    st.markdown("## Date range")
+    dr_option = st.selectbox("Quick range", ["Today", "Last 7 days", "Last 30 days", "Custom"], index=0)
+    if dr_option == "Today":
+        start_sel = date.today(); end_sel = date.today()
+    elif dr_option == "Last 7 days":
+        start_sel = date.today() - timedelta(days=6); end_sel = date.today()
+    elif dr_option == "Last 30 days":
+        start_sel = date.today() - timedelta(days=29); end_sel = date.today()
+    else:
+        start_sel = st.date_input("Start date", value=date.today() - timedelta(days=6))
+        end_sel = st.date_input("End date", value=date.today())
+
+    st.session_state.start_date = start_sel
+    st.session_state.end_date = end_sel
+
+# ensure logged in
+if "user" not in st.session_state or not st.session_state.get("user"):
+    st.warning("Please login in the left sidebar to continue.")
     st.stop()
 
-# ---------------
-# NAVIGATION
-# ---------------
-PAGES = ["Pipeline", "Leads", "Scheduler", "Estimates", "CPA & ROI", "Customer Portal", "Auto-Followups", "Settings", "Users", "Exports"]
-if "page" not in st.session_state:
-    st.session_state.page = "Pipeline"
+# pull leads for selected date range
+start_d = st.session_state.get("start_date", None)
+end_d = st.session_state.get("end_date", None)
+leads_df = get_leads_df_cached(start_d, end_d)
 
-with st.container():
-    st.markdown(f"""
-    <div class='header'>
-      <div>
-        <span class='brand'>Project X — Pro</span><br>
-        <span class='small-muted'>Restoration Pipeline & Field Ops</span>
-      </div>
-      <div class='topbar'>
-        <div class='small-muted'>User: <b>{st.session_state.user}</b></div>
-        <div style='width:12px'></div>
-        <select id='nav_select' onChange='window.location.href=\"?nav=\"+this.value'>
-          <option value='Pipeline'>Pipeline</option>
-        </select>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# Streamlit-native nav using radio for speed
-selected = st.sidebar.radio("Go to", PAGES, index=PAGES.index(st.session_state.page) if st.session_state.page in PAGES else 0)
-st.session_state.page = selected
-
-# global date range controls (top-right like Google Ads)
-col_l, col_r = st.columns([3,1])
-with col_r:
-    date_quick = st.selectbox("Range", ["Today","Last 7 days","Last 30 days","All","Custom"], index=0)
-    if date_quick == "Today":
-        dt_start = date.today(); dt_end = date.today()
-    elif date_quick == "Last 7 days":
-        dt_start = date.today() - timedelta(days=6); dt_end = date.today()
-    elif date_quick == "Last 30 days":
-        dt_start = date.today() - timedelta(days=29); dt_end = date.today()
-    elif date_quick == "All":
-        dt_start = None; dt_end = None
+# show alerts dropdown if toggled
+if st.session_state.get("alerts_open", False):
+    st.markdown("### SLA / Overdue Leads")
+    st.markdown("*Close this panel by clicking the bell again.*")
+    if leads_df.empty:
+        st.info("No leads found")
     else:
-        custom = st.date_input("Start - End", [date.today() - timedelta(days=6), date.today()])
-        if isinstance(custom, (list,tuple)) and len(custom)==2:
-            dt_start, dt_end = custom[0], custom[1]
+        overdue_df = leads_df[leads_df["status"].str.lower() == "overdue"]
+        if overdue_df.empty:
+            st.info("No overdue leads")
         else:
-            dt_start, dt_end = date.today(), date.today()
+            for _, r in overdue_df.sort_values("created_at").iterrows():
+                remain_sec, is_overdue = compute_remaining_sla_seconds(r["sla_entered_at"], r["sla_hours"])
+                hours_left = int(remain_sec // 3600) if remain_sec not in (float("inf"), None) else "—"
+                st.markdown(f"<div class='lead-card'><b>#{int(r['id'])} — {r['contact_name'] or 'No name'}</b>  ·  <span style='color:#22c55e;'>${r['estimated_value']:,.0f}</span><br><span class='small-muted'>Status: {r['status']} • Owner: {r.get('owner') or '—'}</span><div style='float:right'><span style='color:#dc2626;font-weight:700;'>{'OVERDUE' if is_overdue else str(hours_left)+'h left'}</span></div></div>", unsafe_allow_html=True)
 
-# -----------------------
-# Page: Pipeline (main)
-# -----------------------
-def page_pipeline():
-    st.title("TOTAL LEAD PIPELINE — KEY PERFORMANCE INDICATOR")
-    st.markdown("<em>High-level pipeline performance. KPI cards show current snapshot.</em>", unsafe_allow_html=True)
+# ------------------ PAGES ------------------
 
-    df = cached_leads(dt_start, dt_end)
+# 1) Pipeline Board
+def page_pipeline_board(df: pd.DataFrame):
+    st.header("TOTAL LEAD PIPELINE — KEY PERFORMANCE INDICATOR")
+    st.markdown("*High-level pipeline performance at a glance. Use filters to drill into details.*")
+
+    if df.empty:
+        st.info("No leads in selected range. Create a lead in Leads / Capture.")
+        return
+
     total_leads = len(df)
-    qualified = len(df[df["qualified"]==True]) if not df.empty else 0
-    sla_success = int(df["contacted"].sum()) if not df.empty else 0
-    awarded = len(df[df["status"].str.lower()=="awarded"]) if not df.empty else 0
-    lost = len(df[df["status"].str.lower()=="lost"]) if not df.empty else 0
-    closed = awarded + lost
-    conversion_rate = (awarded/closed*100) if closed else 0
-    inspection_pct = (df["inspection_scheduled"].sum() / max(1, qualified) * 100) if not df.empty else 0
-    estimate_sent = int(df["estimate_submitted"].sum()) if not df.empty else 0
-    pipeline_job_value = float(df["estimated_value"].sum()) if not df.empty else 0.0
-    total_spend = float(df["cost_to_acquire"].sum()) if not df.empty else 0.0
-    active = total_leads - (awarded + lost)
+    qualified = int(df[df["qualified"] == True].shape[0])
+    sla_contacts = int(df[df["contacted"] == True].shape[0])
+    awarded_count = int(df[df["status"].str.lower() == "awarded"].shape[0])
+    lost_count = int(df[df["status"].str.lower() == "lost"].shape[0])
+    inspection_scheduled_count = int(df[df["inspection_scheduled"] == True].shape[0])
+    estimate_sent_count = int(df[df["estimate_submitted"] == True].shape[0])
+    pipeline_job_value = float(df["estimated_value"].sum() or 0.0)
+    active_leads = total_leads - (awarded_count + lost_count)
 
-    KPI = [
-        ("Active Leads", active, "#2563eb", (active / max(1,total_leads))*100 if total_leads else 0),
-        ("SLA Success", f"{(sla_success/ max(1,total_leads))*100:.1f}%", "#0ea5a4", (sla_success / max(1,total_leads))*100 if total_leads else 0),
-        ("Qualification Rate", f"{(qualified/ max(1,total_leads))*100:.1f}%", "#a855f7", (qualified / max(1,total_leads))*100 if total_leads else 0),
-        ("Conversion Rate", f"{conversion_rate:.1f}%", "#f97316", conversion_rate),
-        ("Inspections Booked", f"{inspection_pct:.1f}%", "#ef4444", inspection_pct),
-        ("Estimates Sent", estimate_sent, "#6d28d9", (estimate_sent / max(1,total_leads))*100 if total_leads else 0),
-        ("Pipeline Job Value", f"${pipeline_job_value:,.0f}", "#22c55e", min(100, pipeline_job_value / max(1, total_leads*5000) * 100))
+    sla_success_pct = (sla_contacts / total_leads * 100) if total_leads else 0.0
+    qualification_pct = (qualified / total_leads * 100) if total_leads else 0.0
+    closed = awarded_count + lost_count
+    conversion_rate = (awarded_count / closed * 100) if closed else 0.0
+    inspection_pct = (inspection_scheduled_count / qualified * 100) if qualified else 0.0
+
+    KPI_ITEMS = [
+        ("Active Leads", f"{active_leads}", "#2563eb"),
+        ("SLA Success", f"{sla_success_pct:.1f}%", "#0ea5a4"),
+        ("Qualification Rate", f"{qualification_pct:.1f}%", "#a855f7"),
+        ("Conversion Rate", f"{conversion_rate:.1f}%", "#f97316"),
+        ("Inspections Booked", f"{inspection_pct:.1f}%", "#ef4444"),
+        ("Estimates Sent", f"{estimate_sent_count}", "#6d28d9"),
+        ("Pipeline Job Value", f"${pipeline_job_value:,.0f}", "#22c55e"),
     ]
 
-    # two rows: 4 + 3
-    r1 = st.columns(4)
-    r2 = st.columns(3)
-    for col,(title,val,color,pct) in zip(r1, KPI[:4]):
-        col.markdown(f"<div class='kpi-card'><div class='kpi-title'>{title}</div><div class='kpi-value' style='color:{color};'>{val}</div><div class='progress-wrap'><div class='progress-fill' style='width:{pct:.1f}%;background:{color};'></div></div></div>", unsafe_allow_html=True)
-    for col,(title,val,color,pct) in zip(r2, KPI[4:]):
-        col.markdown(f"<div class='kpi-card'><div class='kpi-title'>{title}</div><div class='kpi-value' style='color:{color};'>{val}</div><div class='progress-wrap'><div class='progress-fill' style='width:{pct:.1f}%;background:{color};'></div></div></div>", unsafe_allow_html=True)
+    # Render 2 rows: 4 + 3
+    c1, c2, c3, c4 = st.columns(4)
+    c5, c6, c7 = st.columns(3)
+    cols = [c1, c2, c3, c4, c5, c6, c7]
+    for col, item in zip(cols, KPI_ITEMS):
+        title, value, color = item
+        pct = 50  # default progress visual; you can compute more meaningful percent per KPI
+        col.markdown(f"""
+            <div class="kpi">
+              <div class="title">{title}</div>
+              <div class="value" style="color:{color};">{value}</div>
+              <div class="progress" style="background:{color}; width:{pct}%;"></div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader("Lead Pipeline Stages")
+    st.markdown("*Distribution of leads across stages.*")
+
+    # Show donut (in analytics only per your earlier ask) — here show simplified counts bar to avoid missing libs
+    stage_counts = df["status"].value_counts().to_dict()
+    st.write(stage_counts)
 
     st.markdown("---")
     st.subheader("TOP 5 PRIORITY LEADS")
-    st.markdown("<em>Priority is computed from estimated value, SLA urgency and flags (internal scoring).</em>", unsafe_allow_html=True)
+    st.markdown("*Highest urgency leads by priority score (computed internally).*")
 
-    # compute score simple formula (value / baseline) + SLA urgency
-    weights = {"value_baseline":5000.0, "sla_weight":0.4, "value_weight":0.6}
+    # compute priority for each lead dict and show top5
     pr_list = []
-    for _, row in df.iterrows():
-        val = row.get("estimated_value") or 0.0
-        vs = min(1.0, val / weights["value_baseline"])
-        sla_sec, overdue = compute_sla_remaining(row.get("sla_entered_at") or row.get("created_at"), row.get("sla_hours") or 24)
-        time_left_h = sla_sec/3600.0 if sla_sec not in (None, float("inf")) else 9999.0
-        sla_component = max(0.0, (72.0 - min(time_left_h,72.0)) / 72.0)
-        score = vs * weights["value_weight"] + sla_component * weights["sla_weight"]
-        pr_list.append({"id": row["id"], "name": row["contact_name"], "value": val, "time_left_h": time_left_h, "overdue": overdue, "score": score, "status": row["status"]})
-    pr_df = pd.DataFrame(pr_list).sort_values("score", ascending=False).head(5)
+    for _, r in df.iterrows():
+        score = compute_priority(r.to_dict())
+        pr_list.append({**r.to_dict(), "priority_score": score})
+    pr_df = pd.DataFrame(pr_list).sort_values("priority_score", ascending=False).head(5)
+
     if pr_df.empty:
         st.info("No priority leads")
     else:
         for _, r in pr_df.iterrows():
-            time_html = f"<span style='color:#ef4444;font-weight:700;'>{int(r['time_left_h'])}h</span>" if not r["overdue"] else "<span style='color:#ef4444;font-weight:900;'>OVERDUE</span>"
-            money_html = f"<span style='color:#22c55e;font-weight:800;'>${r['value']:,.0f}</span>"
-            st.markdown(f"<div style='padding:10px;border-radius:8px;border:1px solid #eee;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;'><div><b>#{int(r['id'])} — {r['name'] or 'No name'}</b><div class='small-muted'>Status: {r['status']}</div></div><div style='text-align:right;'>{money_html}<div style='margin-top:6px;color:#ef4444'>{time_html}</div></div></div>", unsafe_allow_html=True)
+            rem_sec, overdue = compute_remaining_sla_seconds(r["sla_entered_at"], r["sla_hours"])
+            hours_left = int(rem_sec // 3600) if rem_sec not in (float("inf"), None) else "—"
+            time_html = f"<span style='color:#dc2626;font-weight:700;'>{'OVERDUE' if overdue else str(hours_left)+'h left'}</span>"
+            money_html = f"<span style='color:#22c55e;font-weight:800;'>${r['estimated_value']:,.0f}</span>"
+            st.markdown(f"<div class='lead-card'><b>#{int(r['id'])} — {r['contact_name'] or 'No name'}</b>  <div style='float:right'>{money_html}</div><br><div class='small-muted'>Status: {r['status']}</div><div style='margin-top:6px'>{time_html}</div></div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("All leads")
-    st.markdown("<em>Expand a lead to edit status, assign owner, add notes, upload invoice.</em>", unsafe_allow_html=True)
+    st.subheader("All Leads (expand a card to edit / change status)")
+    st.markdown("*Click a lead to open the editor.*")
 
-    # Search and filters
-    c1, c2, c3 = st.columns([2,2,4])
-    with c1:
-        f_status = st.selectbox("Status", ["All"] + sorted(df["status"].dropna().unique().tolist()) if not df.empty else ["All"])
-    with c2:
-        f_owner = st.text_input("Owner (quick filter)")
-    with c3:
-        q = st.text_input("Search name / phone / email / address")
+    # Quick filter and search interface
+    col_a, col_b, col_c = st.columns([2, 2, 3])
+    with col_a:
+        status_filter = st.selectbox("Filter status", options=["All"] + sorted(df["status"].dropna().unique().tolist()))
+    with col_b:
+        owner_filter = st.text_input("Filter owner (quick)")
+    with col_c:
+        q = st.text_input("Search (name, phone, email, address)")
+
     df_view = df.copy()
-    if f_status and f_status != "All":
-        df_view = df_view[df_view["status"]==f_status]
-    if f_owner:
-        df_view = df_view[df_view["owner"].str.contains(f_owner, case=False, na=False)]
+    if status_filter and status_filter != "All":
+        df_view = df_view[df_view["status"] == status_filter]
+    if owner_filter:
+        df_view = df_view[df_view["owner"].str.contains(owner_filter, case=False, na=False)]
     if q:
         ql = q.lower()
         df_view = df_view[df_view.apply(lambda r: ql in str(r["contact_name"]).lower() or ql in str(r["contact_phone"]).lower() or ql in str(r["contact_email"]).lower() or ql in str(r["property_address"]).lower(), axis=1)]
 
-    # show limited rows for speed, allow expand
-    show_n = st.number_input("Rows to show", min_value=5, max_value=500, value=25, step=5)
-    st.dataframe(df_view.sort_values("created_at", ascending=False).head(show_n))
+    # show first N rows for speed
+    rows_to_show = min(100, df_view.shape[0])
+    st.dataframe(df_view.sort_values("created_at", ascending=False).head(rows_to_show))
 
-    # quick lead create inline
-    with st.expander("Quick add lead"):
-        form = st.form("quick_add")
-        cname = form.text_input("Name")
-        cphone = form.text_input("Phone")
-        cemail = form.text_input("Email")
-        csource = form.selectbox("Source", ["Google Ads","Website","Referral","Facebook","Instagram","TikTok","LinkedIn","Other"])
-        cval = form.number_input("Est. job value", min_value=0.0, value=0.0, step=100.0)
-        ccost = form.number_input("Cost to acquire", min_value=0.0, value=0.0, step=1.0)
-        csubmit = form.form_submit_button("Add")
-        if csubmit:
+    # Expandable editors
+    for _, row in df_view.head(rows_to_show).iterrows():
+        with st.expander(f"Lead #{int(row['id'])} — {row['contact_name'] or 'No name'}"):
+            colL, colR = st.columns([3, 1])
+            with colL:
+                st.write("**Details**")
+                st.write(f"Source: {row['source']}  •  Damage: {row.get('damage_type')}")
+                st.write(f"Address: {row.get('property_address')}")
+                st.write(f"Notes: {row.get('notes')}")
+            with colR:
+                entered = row.get("sla_entered_at") or row.get("created_at")
+                rem_sec, overdue = compute_remaining_sla_seconds(entered, row.get("sla_hours") or 24)
+                if overdue:
+                    st.markdown("<div style='color:#ef4444;font-weight:700;'>❗ OVERDUE</div>", unsafe_allow_html=True)
+                else:
+                    hours = int(rem_sec // 3600)
+                    mins = int((rem_sec % 3600) // 60)
+                    st.markdown(f"<div style='color:#ef4444;font-weight:700;'>⏳ {hours}h {mins}m left</div>", unsafe_allow_html=True)
+
+            # editor
+            new_status = st.selectbox("Status", options=["New", "Contacted", "Inspection Scheduled", "Inspection Completed", "Estimate Submitted", "Awarded", "Lost"], index=0, key=f"status_edit_{row['id']}")
+            new_owner = st.text_input("Assigned to", value=row.get("owner") or "", key=f"owner_edit_{row['id']}")
+            new_est_val = st.number_input("Job Value Estimate (USD)", value=float(row.get("estimated_value") or 0.0), min_value=0.0, step=100.0, key=f"est_edit_{row['id']}")
+            upload = st.file_uploader("Upload awarded invoice (optional)", type=["pdf", "jpg", "jpeg", "png"], key=f"inv_{row['id']}")
+
+            if st.button("Save", key=f"save_{row['id']}"):
+                updates = {
+                    "status": new_status,
+                    "owner": new_owner,
+                    "estimated_value": float(new_est_val or 0.0),
+                    "sla_entered_at": row.get("sla_entered_at") or row.get("created_at")
+                }
+                if upload:
+                    # save upload
+                    path = os.path.join(UPLOAD_DIR, f"lead_{int(row['id'])}_{upload.name}")
+                    with open(path, "wb") as f:
+                        f.write(upload.getbuffer())
+                    updates["awarded_invoice"] = path
+                try:
+                    update_lead(int(row["id"]), updates, actor=st.session_state.get("user"), note="Updated via UI")
+                    st.success("Lead updated")
+                    # clear cache
+                    get_leads_df_cached.clear()
+                except Exception as e:
+                    st.error(f"Failed to update lead: {e}")
+                    st.write(traceback.format_exc())
+
+# 2) Leads / Capture
+def page_leads_capture():
+    st.header("📇 Lead Capture")
+    with st.form("lead_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            source = st.selectbox("Lead Source", ["Google Ads", "Organic Search", "Referral", "Phone", "Insurance", "Facebook", "Instagram", "Other"])
+            source_details = st.text_input("Source details (UTM / notes)", placeholder="utm_source=google...")
+            contact_name = st.text_input("Contact name", placeholder="John Doe")
+            contact_phone = st.text_input("Contact phone", placeholder="+1-555-0123")
+            contact_email = st.text_input("Contact email", placeholder="name@example.com")
+        with c2:
+            property_address = st.text_input("Property address", placeholder="123 Main St, City, State")
+            damage_type = st.selectbox("Damage type", ["water", "fire", "mold", "contents", "reconstruction", "other"])
+            assigned_to = st.text_input("Assigned to", placeholder="Estimator name")
+            qualified_choice = st.selectbox("Is the Lead Qualified?", ["No", "Yes"], index=0)
+            sla_hours = st.number_input("SLA hours (first response)", min_value=1, value=24, step=1)
+        notes = st.text_area("Notes", placeholder="Additional context...")
+        estimated_value = st.number_input("Estimated value (USD)", min_value=0.0, value=0.0, step=100.0)
+        cost_to_acquire = st.number_input("Cost to acquire lead (USD)", min_value=0.0, value=0.0, step=1.0)
+        submitted = st.form_submit_button("Create Lead")
+        if submitted:
             payload = {
-                "contact_name": cname, "contact_phone": cphone, "contact_email": cemail,
-                "source": csource, "estimated_value": float(cval), "cost_to_acquire": float(ccost),
-                "sla_entered_at": datetime.utcnow(), "created_at": datetime.utcnow(), "status": "New"
+                "source": source,
+                "source_details": source_details,
+                "contact_name": contact_name,
+                "contact_phone": contact_phone,
+                "contact_email": contact_email,
+                "property_address": property_address,
+                "damage_type": damage_type,
+                "assigned_to": assigned_to,
+                "notes": notes,
+                "estimated_value": float(estimated_value),
+                "sla_hours": int(sla_hours),
+                "sla_entered_at": datetime.utcnow(),
+                "qualified": True if qualified_choice == "Yes" else False,
+                "cost_to_acquire": float(cost_to_acquire),
+                "owner": assigned_to or None
             }
             try:
-                add_lead_to_db(payload)
-                st.success("Lead added")
-                # clear cache and rerun
-                cached_leads.clear()
-                st.experimental_rerun()
+                add_lead(payload)
+                st.success("Lead created")
+                get_leads_df_cached.clear()
             except Exception as e:
-                st.error("Failed to add lead: " + str(e))
+                st.error(f"Failed to create lead: {e}")
+                st.write(traceback.format_exc())
 
-# -----------------------
-# Page: Scheduler
-# -----------------------
-def page_scheduler():
-    st.title("📅 Tech Job Calendar — Scheduler")
-    st.markdown("<em>Assign inspection dates to leads and view upcoming jobs.</em>", unsafe_allow_html=True)
-    df = cached_leads(dt_start, dt_end)
-    if df.empty:
-        st.info("No leads in selected range.")
-        return
-    # show upcoming scheduled inspection jobs
-    scheduled = df[df["inspection_scheduled"]==True].copy()
-    scheduled["inspection_date"] = scheduled["inspection_scheduled_at"]
-    scheduled = scheduled.sort_values("inspection_date").head(200)
-    st.subheader("Upcoming Inspections")
-    if scheduled.empty:
-        st.info("No inspections scheduled yet.")
-    else:
-        st.dataframe(scheduled[["id","contact_name","assigned_to","inspection_scheduled_at","property_address"]].rename(columns={"inspection_scheduled_at":"inspection_date"}))
-
-    # schedule new inspection
     st.markdown("---")
-    st.subheader("Schedule an Inspection")
-    ids = df["id"].tolist()
-    sel = st.selectbox("Lead", [""] + [f"#{i} — {df.loc[df['id']==i,'contact_name'].values[0] if i in df['id'].values else ''}" for i in ids])
-    if sel:
-        lid = int(sel.split()[0].lstrip("#"))
-        dt = st.date_input("Inspection Date", date.today())
-        time_input = st.time_input("Inspection time", datetime.now().time())
-        tech = st.text_input("Assign Tech", value="")
-        if st.button("Schedule"):
-            dt_full = datetime.combine(dt, time_input)
-            try:
-                update_lead_db(lid, {"inspection_scheduled": True, "inspection_scheduled_at": dt_full, "assigned_to": tech}, actor=st.session_state.user, note="Inspection scheduled")
-                st.success("Inspection scheduled")
-                cached_leads.clear()
-            except Exception as e:
-                st.error("Failed to schedule: " + str(e))
+    st.subheader("Recent Leads")
+    df = get_leads_df_cached(start_d, end_d)
+    if df.empty:
+        st.info("No leads yet.")
+    else:
+        st.dataframe(df.sort_values("created_at", ascending=False).head(200))
 
-# -----------------------
-# Page: Estimates (PDF/HTML)
-# -----------------------
-def page_estimates():
-    st.title("🧾 Estimates & Invoices")
-    st.markdown("<em>Create quick estimates and download as HTML or PDF.</em>", unsafe_allow_html=True)
-    df = cached_leads(dt_start, dt_end)
+
+# 3) Analytics & SLA
+def page_analytics_sla():
+    st.header("📈 Analytics & SLA")
+    st.markdown("*SLA trend and pipeline breakdown.*")
+    df = get_leads_df_cached(start_d, end_d)
     if df.empty:
         st.info("No leads.")
         return
-    lid = st.selectbox("Lead for estimate", [""] + [f"#{int(r)} — {df.loc[df['id']==r,'contact_name'].values[0]}" for r in df["id"].tolist()])
-    if lid:
-        lead_id = int(lid.split()[0].lstrip("#"))
-        lead_row = df[df["id"]==lead_id].iloc[0].to_dict()
-        st.write("Lead:", lead_row["contact_name"], lead_row["contact_phone"])
-        items = st.text_area("Estimate line items (one per line, format: description | qty | unit_price)", value="Inspection | 1 | 150\nRemediation | 1 | 1200")
-        notes = st.text_area("Notes / Terms", value="Estimate valid for 30 days.")
-        if st.button("Generate Estimate"):
-            try:
-                lines = []
-                total = 0.0
-                for line in items.splitlines():
-                    parts = [p.strip() for p in line.split("|")]
-                    if len(parts) >= 3:
-                        desc, qty, up = parts[0], float(parts[1]), float(parts[2])
-                        amt = qty * up
-                        lines.append({"desc":desc,"qty":qty,"unit":up,"amt":amt})
-                        total += amt
-                # build HTML
-                html = f"""
-                <html><head><meta charset='utf-8'><title>Estimate #{lead_id}</title></head>
-                <body style='font-family:Arial;padding:20px;'>
-                <h2>Estimate for {lead_row['contact_name']}</h2>
-                <p>Address: {lead_row.get('property_address','')}</p>
-                <table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;width:100%'>
-                <tr><th>Description</th><th>Qty</th><th>Unit</th><th>Amount</th></tr>
-                """
-                for it in lines:
-                    html += f"<tr><td>{it['desc']}</td><td>{it['qty']}</td><td>${it['unit']:.2f}</td><td>${it['amt']:.2f}</td></tr>"
-                html += f"<tr><td colspan='3' style='text-align:right;font-weight:bold;'>Total</td><td style='font-weight:bold;'>${total:.2f}</td></tr>"
-                html += f"</table><p>{notes}</p></body></html>"
-                b = html.encode("utf-8")
-                st.success("Estimate generated")
-                st.download_button("Download HTML Estimate", data=b, file_name=f"estimate_{lead_id}.html", mime="text/html")
-                if FPDF_AVAILABLE:
-                    pdf = FPDF()
-                    pdf.add_page()
-                    pdf.set_font("Arial", size=12)
-                    pdf.cell(0,10, f"Estimate for {lead_row['contact_name']}", ln=True)
-                    pdf.cell(0,8, f"Address: {lead_row.get('property_address','')}", ln=True)
-                    pdf.ln(6)
-                    for it in lines:
-                        pdf.cell(0,8, f"{it['desc']} — {it['qty']} x ${it['unit']:.2f} = ${it['amt']:.2f}", ln=True)
-                    pdf.ln(6)
-                    pdf.cell(0,8, f"Total: ${total:.2f}", ln=True)
-                    pdf_out = pdf.output(dest='S').encode('latin-1')
-                    st.download_button("Download PDF Estimate", data=pdf_out, file_name=f"estimate_{lead_id}.pdf", mime="application/pdf")
-                else:
-                    st.info("fpdf not installed — PDF download disabled (HTML available).")
-            except Exception as e:
-                st.error("Failed to generate estimate: " + str(e))
 
-# -----------------------
-# Page: CPA & ROI
-# -----------------------
-def page_cpa():
-    st.title("💰 CPA & ROI")
-    st.markdown("<em>Marketing spend (cost_to_acquire) vs conversions (Awarded).</em>", unsafe_allow_html=True)
-    df = cached_leads(dt_start, dt_end)
-    if df.empty:
-        st.info("No data.")
-        return
-    total_spend = float(df["cost_to_acquire"].sum())
-    conversions = int(df[df["status"].str.lower()=="awarded"].shape[0])
-    cpa = total_spend / conversions if conversions else 0.0
-    revenue = float(df[df["status"].str.lower()=="awarded"]["estimated_value"].sum())
-    roi_val = revenue - total_spend
-    roi_pct = (roi_val/total_spend*100) if total_spend else 0.0
-
-    st.markdown(f"**Total Marketing Spend:** <span style='color:#ef4444;font-weight:700;'>${total_spend:,.2f}</span>", unsafe_allow_html=True)
-    st.markdown(f"**Conversions (Won):** <span style='color:#2563eb;font-weight:700;'>{conversions}</span>", unsafe_allow_html=True)
-    st.markdown(f"**CPA:** <span style='color:#f97316;font-weight:700;'>${cpa:,.2f}</span>", unsafe_allow_html=True)
-    st.markdown(f"**ROI:** <span style='color:#22c55e;font-weight:700;'>${roi_val:,.2f} ({roi_pct:.1f}%)</span>", unsafe_allow_html=True)
-
-    # chart (simple)
-    if px:
-        agg = df.copy()
-        agg["date"] = agg["created_at"].dt.date
-        daily = agg.groupby("date").agg(total_spend=("cost_to_acquire","sum"), conversions=("id", lambda s: df.loc[s.index,"status"].str.lower().eq("awarded").sum())).reset_index()
-        fig = px.line(daily, x="date", y=["total_spend","conversions"], markers=True)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("plotly not available — chart disabled.")
-
-# -----------------------
-# Page: Customer Portal (lightweight)
-# -----------------------
-def page_customer_portal():
-    st.title("🔒 Customer Portal (View by email + token)")
-    st.markdown("<em>A lightweight view that allows customers to check their lead status with email + access token (email-based token).</em>", unsafe_allow_html=True)
-    email = st.text_input("Customer Email")
-    token = st.text_input("Access token (enter last 4 characters of email for demo)")
-    if st.button("View"):
-        if not email:
-            st.warning("Enter an email")
-        else:
-            # simple token check: last 4 letters must match for demo
-            ok = token == (email[-4:] if len(email) >=4 else email)
-            if not ok:
-                st.error("Invalid token")
-            else:
-                s = get_session()
-                try:
-                    leads = s.query(Lead).filter(Lead.contact_email == email).order_by(Lead.created_at.desc()).all()
-                    if not leads:
-                        st.info("No records found for this email")
-                    else:
-                        for L in leads:
-                            st.markdown(f"**Lead #{L.id} — {L.contact_name}**  \nStatus: **{L.status}**  \nEstimated Value: ${L.estimated_value or 0:,.2f}  \nCreated: {L.created_at}")
-                finally:
-                    s.close()
-
-# -----------------------
-# Page: Auto-Followups
-# -----------------------
-def page_autofollow():
-    st.title("✉️ Auto Follow-up Workflows")
-    st.markdown("<em>Define message templates and queue follow-ups. Sending is simulated (no SMTP by default).</em>", unsafe_allow_html=True)
-    st.subheader("Templates")
-    if "af_templates" not in st.session_state:
-        st.session_state.af_templates = {"Default": "Hi {name}, following up on your request for {address}. Reply to schedule."}
-    tname = st.text_input("Template name", value="FollowUp")
-    tbody = st.text_area("Template body (use {name}, {address})", value="Hi {name}, following up on your lead at {address}. Please reply.")
-    if st.button("Save Template"):
-        st.session_state.af_templates[tname] = tbody
-        st.success("Template saved")
-    st.write("Saved templates:")
-    for k,v in st.session_state.af_templates.items():
-        st.markdown(f"**{k}** — {v}")
+    # SLA trend: count overdue per day for last 30 days
+    today = datetime.utcnow().date()
+    days = [today - timedelta(days=i) for i in range(29, -1, -1)]
+    counts = []
+    for d in days:
+        start_d_ = datetime.combine(d, datetime.min.time())
+        end_d_ = datetime.combine(d, datetime.max.time())
+        subset = df[(df["created_at"] >= start_d_) & (df["created_at"] <= end_d_)]
+        overdue_count = subset[subset["status"].str.lower() == "overdue"].shape[0]
+        counts.append(overdue_count)
+    # chart
+    fig = plt.figure(figsize=(8, 3))
+    plt.plot(days, counts, marker="o")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig)
 
     st.markdown("---")
-    st.subheader("Queue follow-ups")
-    df = cached_leads(dt_start, dt_end)
-    lead_options = [""] + [f"#{int(r)} — {df.loc[df['id']==r,'contact_name'].values[0]}" for r in df["id"].tolist()] if not df.empty else [""]
-    sel = st.selectbox("Select lead to queue follow-up", lead_options)
-    tpl = st.selectbox("Template", list(st.session_state.af_templates.keys()))
-    when = st.date_input("Send date", date.today())
-    if st.button("Queue Follow-up"):
-        if not sel:
-            st.warning("Select lead")
-        else:
-            lid = int(sel.split()[0].lstrip("#"))
-            # store queue in session (simple persistent list)
-            if "af_queue" not in st.session_state:
-                st.session_state.af_queue = []
-            st.session_state.af_queue.append({"lead_id": lid, "template": tpl, "send_on": when.isoformat(), "queued_by": st.session_state.user})
-            st.success("Queued")
-    st.subheader("Queued follow-ups")
-    qdf = pd.DataFrame(st.session_state.get("af_queue", []))
-    if qdf.empty:
-        st.info("No queued follow-ups")
-    else:
-        st.dataframe(qdf)
+    st.subheader("Pipeline Stages (counts)")
+    st.table(df["status"].value_counts().rename_axis("stage").reset_index(name="count"))
 
-    if st.button("Export queued as CSV"):
-        dfq = pd.DataFrame(st.session_state.get("af_queue", []))
-        st.download_button("Download CSV", data=dfq.to_csv(index=False).encode("utf-8"), file_name="followup_queue.csv", mime="text/csv")
 
-# -----------------------
-# Page: Settings & Users
-# -----------------------
-def page_settings():
-    st.title("⚙️ Settings")
-    st.markdown("<em>App-wide settings, lead source manager, alert toggles, and user/role admin.</em>", unsafe_allow_html=True)
-    st.subheader("Lead Sources")
-    sources = ["Google Ads","Website","Referral","Facebook","Instagram","TikTok","LinkedIn","Yelp","Walk-In","Hotline"]
-    for s in sources:
-        st.checkbox(s, value=True, key=f"src_{s}")
-
-    st.subheader("Alerts")
-    st.checkbox("Enable SLA email alerts (requires SMTP)", key="enable_sla_alerts")
-    st.checkbox("Show alert bell", value=True, key="show_bell")
-
-    st.subheader("Users (Admin only)")
-    if st.session_state.role != "Admin":
-        st.info("Only Admin can manage users")
-    else:
-        s = get_session()
-        try:
-            users = s.query(User).all()
-            for u in users:
-                cols = st.columns([3,2,2])
-                cols[0].text_input("Full name", value=u.full_name or "", key=f"u_name_{u.username}")
-                cols[1].selectbox("Role", ["Viewer","Estimator","Adjuster","Tech","Admin"], index=["Viewer","Estimator","Adjuster","Tech","Admin"].index(u.role if u.role in ["Viewer","Estimator","Adjuster","Tech","Admin"] else "Viewer"), key=f"u_role_{u.username}")
-                if cols[2].button("Save", key=f"save_u_{u.username}"):
-                    s2 = get_session()
-                    try:
-                        uu = s2.query(User).filter(User.username==u.username).first()
-                        uu.full_name = st.session_state.get(f"u_name_{u.username}", uu.full_name)
-                        uu.role = st.session_state.get(f"u_role_{u.username}", uu.role)
-                        s2.commit()
-                        st.success("Saved")
-                    finally:
-                        s2.close()
-        finally:
-            s.close()
-
-# -----------------------
-# Page: Exports
-# -----------------------
-def page_exports():
-    st.title("📤 Exports")
-    st.markdown("Export leads, estimates, follow-up queue.")
-    df = cached_leads(dt_start, dt_end)
+# 4) CPA & ROI
+def page_cpa_roi():
+    st.header("💰 CPA & ROI")
+    df = get_leads_df_cached(start_d, end_d)
     if df.empty:
         st.info("No leads")
         return
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download leads.csv", csv, file_name="leads.csv", mime="text/csv")
+    total_spend = float(df["cost_to_acquire"].sum())
+    df_awarded = df[df["status"].str.lower() == "awarded"]
+    won_count = int(df_awarded.shape[0])
+    cpa = (total_spend / won_count) if (won_count and total_spend) else (0.0 if total_spend else 0.0)
+    pipeline_value = float(df["estimated_value"].sum())
+    roi = pipeline_value - total_spend
+    roi_pct = (roi / total_spend * 100) if total_spend else 0.0
 
-# -----------------------
-# ROUTE
-# -----------------------
-try:
-    page = st.session_state.page
-    if page == "Pipeline":
-        page_pipeline()
-    elif page == "Leads":
-        # simply reuse pipeline list
-        st.title("Leads")
-        st.markdown("<em>Full lead list and management.</em>", unsafe_allow_html=True)
-        df = cached_leads(dt_start, dt_end)
-        if df.empty:
-            st.info("No leads")
+    st.markdown(f"**Total Marketing Spend:** ${total_spend:,.2f}")
+    st.markdown(f"**Conversions (Won):** {won_count}")
+    st.markdown(f"**CPA:** ${cpa:,.2f}")
+    st.markdown(f"**ROI:** ${roi:,.2f} ({roi_pct:.1f}%)")
+
+    # chart: spend vs conversions simple
+    fig = plt.figure()
+    plt.bar(["Spend", "Conversions"], [total_spend, won_count], color=["#ef4444", "#2563eb"])
+    st.pyplot(fig)
+
+
+# 5) Settings
+def page_settings():
+    st.header("⚙️ Settings")
+    st.markdown("*Lead sources, basic app settings*")
+    st.markdown("Lead sources are visible in lead capture (configurable).")
+    st.text("Note: Role management, SMTP and advanced settings are in Users page.")
+
+
+# 6) Users (role manager)
+def page_users():
+    st.header("👥 Users & Roles")
+    s = get_session()
+    try:
+        users = s.query(User).order_by(User.username).all()
+        if not users:
+            st.info("No users yet (they are created on login).")
         else:
-            st.dataframe(df.sort_values("created_at", ascending=False).head(200))
-    elif page == "Scheduler":
-        page_scheduler()
-    elif page == "Estimates":
-        page_estimates()
-    elif page == "CPA & ROI":
-        page_cpa()
-    elif page == "Customer Portal":
-        page_customer_portal()
-    elif page == "Auto-Followups":
-        page_autofollow()
-    elif page == "Settings":
+            for u in users:
+                cols = st.columns([2, 2, 2, 1])
+                name = cols[0].text_input("Full name", value=u.full_name or "", key=f"uname_{u.username}")
+                role = cols[1].selectbox("Role", ["Viewer", "Estimator", "Adjuster", "Tech", "Admin"], index=["Viewer", "Estimator", "Adjuster", "Tech", "Admin"].index(u.role if u.role in ["Viewer", "Estimator", "Adjuster", "Tech", "Admin"] else "Viewer"), key=f"urole_{u.username}")
+                if cols[3].button("Save", key=f"saveuser_{u.username}"):
+                    try:
+                        uu = s.query(User).filter(User.username == u.username).first()
+                        uu.full_name = st.session_state.get(f"uname_{u.username}", uu.full_name)
+                        uu.role = st.session_state.get(f"urole_{u.username}", uu.role)
+                        s.commit()
+                        st.success(f"Saved {u.username}")
+                    except Exception:
+                        s.rollback()
+    finally:
+        s.close()
+
+
+# 7) Exports
+def page_exports():
+    st.header("📤 Exports")
+    df = get_leads_df_cached(start_d, end_d)
+    if df.empty:
+        st.info("No leads")
+        return
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download leads.csv", csv_bytes, file_name="leads_export.csv", mime="text/csv")
+
+
+# route pages
+page_name = st.session_state.get("page", "Pipeline Board")
+try:
+    if page_name == "Pipeline Board":
+        page_pipeline_board(leads_df)
+    elif page_name == "Leads / Capture":
+        page_leads_capture()
+    elif page_name == "Analytics & SLA":
+        page_analytics_sla()
+    elif page_name == "CPA & ROI":
+        page_cpa_roi()
+    elif page_name == "Settings":
         page_settings()
-    elif page == "Users":
-        st.title("Users")
-        s = get_session()
-        try:
-            ulist = s.query(User).all()
-            st.dataframe(pd.DataFrame([{"username":u.username,"full_name":u.full_name,"role":u.role} for u in ulist]))
-        finally:
-            s.close()
-    elif page == "Exports":
+    elif page_name == "Users":
+        page_users()
+    elif page_name == "Exports":
         page_exports()
     else:
-        st.info("Page not implemented")
+        st.info("Page not found.")
 except Exception as e:
-    st.error("App error: " + str(e))
+    st.error("An error occurred while rendering the page.")
     st.write(traceback.format_exc())
 
-# -----------------------
-# End
-# -----------------------
-st.markdown("<hr><div class='small-muted'>Project X — Pro · Built with Streamlit</div>", unsafe_allow_html=True)
+# footer
+st.markdown("---")
+st.markdown("<div class='small'>Project X — Stable · Streamlit</div>", unsafe_allow_html=True)
