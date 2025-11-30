@@ -1,694 +1,667 @@
-# titan_full.py — TITAN merged full app
+# project_x_ui_update.py
+# Streamlit single-file app with updated UI:
+# - Donut chart in Analytics (pipeline stages)
+# - Alert bell icon + dropdown with dismissible alerts
+# - Top 5 priority leads as black cards (money green, time-left red)
+# - CPA & ROI on black cards with colored titles
+# - Medium-size spend/conversions chart
+# - Main page titles red
+# - Font Comfortaa
+# - Submit buttons red long with white text
+# - Selected date text shown above pages
+# - Settings placeholders for PDF estimates, email followups, calendar, AI recommendations
+
+import os
+from datetime import datetime, timedelta, date
+import traceback
+
 import streamlit as st
 import pandas as pd
-import numpy as np
-import sqlite3
-from sqlite3 import Connection
-from datetime import datetime, timedelta, date
-import io
-import base64
-import os
-import joblib
-import plotly.express as px
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 
-# ----------------------------
-# Configuration
-# ----------------------------
-DB_FILE = 'titan_leads.db'
-MODEL_FILE = 'titan_lead_scoring.joblib'
-PIPELINE_STAGES = ['New', 'Contacted', 'Qualified', 'Estimate Sent', 'Won', 'Lost']
-SLA_HOURS = 72  # SLA threshold for "time left" calculation (72 hours default)
-
-st.set_page_config(page_title="TITAN - Lead Pipeline", layout='wide')
-
-APP_CSS = """
-<style>
-body {background-color: #071129; color: #e6eef8; font-family: 'Comfortaa', sans-serif;}
-@import url('https://fonts.googleapis.com/css2?family=Comfortaa:wght@300;400;700&display=swap');
-.header {display:flex; align-items:center; gap:12px; margin-bottom:6px;}
-.metric-card {background: linear-gradient(135deg,#0ea5a0,#06b6d4); padding:14px; border-radius:10px; color:white}
-.small {font-size:12px; opacity:0.95}
-.kpi {font-size:26px; font-weight:700}
-.card-row {display:flex; gap:12px; flex-wrap:wrap}
-.table-container {background:#0b1220; padding:12px; border-radius:8px}
-.lead-card {background:#071a2a; border-radius:8px; padding:10px; margin-bottom:8px}
-.alert-badge {background:#ef4444;color:#fff;padding:8px 10px;border-radius:8px;cursor:pointer}
-.kpi-black {background:#000;padding:14px;border-radius:10px;color:#fff}
-.small-muted {color:#a7b2c7;font-size:13px}
-.topbar {display:flex; gap:12px; align-items:center; justify-content:space-between}
-.badge-small {background:#111;color:#fff;padding:6px 8px;border-radius:8px}
-</style>
-"""
-st.markdown(APP_CSS, unsafe_allow_html=True)
-
-# ----------------------------
-# Database helpers
-# ----------------------------
-
-def get_conn() -> Connection:
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-    # leads table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS leads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lead_id TEXT UNIQUE,
-            created_at TEXT,
-            source TEXT,
-            stage TEXT,
-            estimated_value REAL,
-            ad_cost REAL,
-            converted INTEGER,
-            notes TEXT,
-            score REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ensure score column exists (backward-compat safety)
-def ensure_score_column():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("PRAGMA table_info(leads)")
-    cols = [r['name'] for r in c.fetchall()]
-    if 'score' not in cols:
-        c.execute("ALTER TABLE leads ADD COLUMN score REAL DEFAULT NULL")
-    conn.commit()
-    conn.close()
-
-ensure_score_column()
-
-# ----------------------------
-# CRUD helpers
-# ----------------------------
-
-def insert_leads(df: pd.DataFrame):
-    conn = get_conn()
-    df = df.copy()
-    df['created_at'] = pd.to_datetime(df['created_at']).astype(str)
-    rows = df[['lead_id','created_at','source','stage','estimated_value','ad_cost','converted','notes']].fillna('').values.tolist()
-    c = conn.cursor()
-    for r in rows:
-        try:
-            c.execute('''INSERT OR IGNORE INTO leads (lead_id,created_at,source,stage,estimated_value,ad_cost,converted,notes)
-                         VALUES (?,?,?,?,?,?,?,?)''', r)
-        except Exception as e:
-            print('Insert error', e)
-    conn.commit()
-    conn.close()
-
-def upsert_lead(row: dict):
-    conn = get_conn()
-    c = conn.cursor()
-    # use INSERT OR REPLACE to simplify (preserves unique lead_id)
-    # But prefer UPSERT syntax
-    c.execute('''
-        INSERT INTO leads (lead_id,created_at,source,stage,estimated_value,ad_cost,converted,notes,score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(lead_id) DO UPDATE SET
-            created_at=excluded.created_at,
-            source=excluded.source,
-            stage=excluded.stage,
-            estimated_value=excluded.estimated_value,
-            ad_cost=excluded.ad_cost,
-            converted=excluded.converted,
-            notes=excluded.notes,
-            score=excluded.score
-    ''', (
-        row.get('lead_id'),
-        row.get('created_at'),
-        row.get('source'),
-        row.get('stage'),
-        float(row.get('estimated_value') or 0.0),
-        float(row.get('ad_cost') or 0.0),
-        int(row.get('converted') or 0),
-        row.get('notes') or '',
-        float(row.get('score')) if row.get('score') is not None else None
-    ))
-    conn.commit()
-    conn.close()
-
-def delete_lead(lead_id: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute('DELETE FROM leads WHERE lead_id=?', (lead_id,))
-    conn.commit()
-    conn.close()
-
-def load_all_leads_df():
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM leads ORDER BY datetime(created_at) DESC", conn)
-    conn.close()
-    # parse dates
-    if not df.empty:
-        df['created_at'] = pd.to_datetime(df['created_at'])
-    return df
-
-# ----------------------------
-# Mock data seeding
-# ----------------------------
-
-def generate_mock_leads_df(n=300):
-    rng = np.random.default_rng(42)
-    created = [ (datetime.now() - timedelta(days=int(x))).isoformat() for x in rng.integers(0,120,size=n) ]
-    sources = rng.choice(['Google Ads','Organic','Referral','Facebook Ads','Direct','Partner'], size=n)
-    stages = rng.choice(PIPELINE_STAGES, size=n, p=[0.18,0.25,0.2,0.15,0.12,0.1])
-    est_value = np.round(rng.normal(2500,1800,size=n).clip(200,25000),2)
-    cost = np.round(rng.normal(55,35,size=n).clip(0,800),2)
-    lead_id = [f"L{200000+i}" for i in range(n)]
-    converted = np.where(stages=='Won',1,0)
-    df = pd.DataFrame({
-        'lead_id':lead_id,
-        'created_at':created,
-        'source':sources,
-        'stage':stages,
-        'estimated_value':est_value,
-        'ad_cost':cost,
-        'converted':converted,
-        'notes':''
-    })
-    return df
-
-# Seed DB with mock data if empty
+# optional plotly
 try:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute('SELECT COUNT(*) AS cnt FROM leads')
-    cnt = cur.fetchone()['cnt']
-    conn.close()
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
 except Exception:
-    cnt = 0
+    PLOTLY_AVAILABLE = False
 
-if cnt == 0:
-    seed = generate_mock_leads_df(300)
-    insert_leads(seed)
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# ----------------------------
-# Utility helpers
-# ----------------------------
+# ---------- CONFIG ----------
+DB_FILE = "project_x_ui_update.db"
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-def to_dataframe(sql: str, params=()):
-    conn = get_conn()
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    if not df.empty and 'created_at' in df.columns:
-        df['created_at'] = pd.to_datetime(df['created_at'])
-    return df
+engine = create_engine(f"sqlite:///{DB_FILE}", connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+Base = declarative_base()
 
-def download_link(df: pd.DataFrame, filename: str):
-    towrite = io.BytesIO()
-    # write excel
+# ---------- MODELS ----------
+class Lead(Base):
+    __tablename__ = "leads"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String, default="Website")
+    source_details = Column(String, nullable=True)
+    contact_name = Column(String, nullable=True)
+    contact_phone = Column(String, nullable=True)
+    contact_email = Column(String, nullable=True)
+    property_address = Column(String, nullable=True)
+    damage_type = Column(String, nullable=True)
+    assigned_to = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
+    estimated_value = Column(Float, nullable=True)
+    status = Column(String, default="New")  # possible: New, Contacted, Inspection Scheduled, Inspection Completed, Estimate Submitted, Awarded, Lost, Overdue
+    created_at = Column(DateTime, default=datetime.utcnow)
+    sla_hours = Column(Integer, default=24)
+    sla_entered_at = Column(DateTime, nullable=True)
+    contacted = Column(Boolean, default=False)
+    inspection_scheduled = Column(Boolean, default=False)
+    inspection_scheduled_at = Column(DateTime, nullable=True)
+    inspection_completed = Column(Boolean, default=False)
+    estimate_submitted = Column(Boolean, default=False)
+    awarded_date = Column(DateTime, nullable=True)
+    awarded_comment = Column(Text, nullable=True)
+    awarded_invoice = Column(String, nullable=True)
+    lost_date = Column(DateTime, nullable=True)
+    lost_comment = Column(Text, nullable=True)
+    qualified = Column(Boolean, default=False)
+    cost_to_acquire = Column(Float, default=0.0)
+    owner = Column(String, default=None)
+    priority_score = Column(Float, default=0.0)
+    time_left_hours = Column(Integer, default=72)  # helper for UI demo
+
+class User(Base):
+    __tablename__ = "users"
+    username = Column(String, primary_key=True)
+    full_name = Column(String, default="")
+    role = Column(String, default="Viewer")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class LeadHistory(Base):
+    __tablename__ = "lead_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lead_id = Column(Integer)
+    updated_by = Column(String)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+    old_status = Column(String)
+    new_status = Column(String)
+    note = Column(Text)
+
+Base.metadata.create_all(engine)
+
+# ---------- UTILITIES ----------
+def get_session():
+    return SessionLocal()
+
+def row_to_dict(r):
+    return {
+        "id": r.id,
+        "source": r.source,
+        "source_details": r.source_details,
+        "contact_name": r.contact_name,
+        "contact_phone": r.contact_phone,
+        "contact_email": r.contact_email,
+        "property_address": r.property_address,
+        "damage_type": r.damage_type,
+        "assigned_to": r.assigned_to,
+        "notes": r.notes,
+        "estimated_value": float(r.estimated_value or 0.0),
+        "status": r.status,
+        "created_at": r.created_at,
+        "sla_hours": int(r.sla_hours or 24),
+        "sla_entered_at": r.sla_entered_at or r.created_at,
+        "contacted": bool(r.contacted),
+        "inspection_scheduled": bool(r.inspection_scheduled),
+        "inspection_scheduled_at": r.inspection_scheduled_at,
+        "inspection_completed": bool(r.inspection_completed),
+        "estimate_submitted": bool(r.estimate_submitted),
+        "awarded_date": r.awarded_date,
+        "awarded_invoice": r.awarded_invoice,
+        "lost_date": r.lost_date,
+        "qualified": bool(r.qualified),
+        "cost_to_acquire": float(r.cost_to_acquire or 0.0),
+        "owner": r.owner,
+        "priority_score": float(r.priority_score or 0.0),
+        "time_left_hours": int(r.time_left_hours or 72)
+    }
+
+@st.cache_data(ttl=30)
+def load_leads(start_date=None, end_date=None):
+    s = get_session()
     try:
-        df.to_excel(towrite, index=False, engine='openpyxl')
-        towrite.seek(0)
-        b64 = base64.b64encode(towrite.read()).decode()
-        href = f'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}'
-        return f'<a href="{href}" download="{filename}">Download {filename}</a>'
-    except Exception as e:
-        # fallback to CSV
-        csv = df.to_csv(index=False).encode('utf-8')
-        b64 = base64.b64encode(csv).decode()
-        href = f'data:text/csv;base64,{b64}'
-        return f'<a href="{href}" download="{filename.replace(".xlsx",".csv")}">Download {filename.replace(".xlsx",".csv")}</a>'
+        q = s.query(Lead).order_by(Lead.created_at.desc()).all()
+        rows = [row_to_dict(r) for r in q]
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        if start_date:
+            df = df[df["created_at"] >= datetime.combine(start_date, datetime.min.time())]
+        if end_date:
+            df = df[df["created_at"] <= datetime.combine(end_date, datetime.max.time())]
+        return df.reset_index(drop=True)
+    finally:
+        s.close()
 
-# ----------------------------
-# Model helpers (train / load / score)
-# ----------------------------
-
-def train_model_from_db():
-    df = load_all_leads_df()
-    if df.empty:
-        return None, "No data"
-    # prepare features
-    df2 = df.copy()
-    df2['age_days'] = (datetime.now() - df2['created_at']).dt.days
-    # One-hot for source and stage
-    X = pd.get_dummies(df2[['source','stage']].astype(str), drop_first=False)
-    X['ad_cost'] = df2['ad_cost']
-    X['estimated_value'] = df2['estimated_value']
-    X['age_days'] = df2['age_days']
-    y = df2['converted']
-    if len(y.unique()) == 1:
-        return None, "Only one class present; cannot train"
-    X_train, X_test, y_train, y_test = train_test_split(X.fillna(0), y, test_size=0.2, random_state=42, stratify=y)
-    model = RandomForestClassifier(n_estimators=150, random_state=42)
-    model.fit(X_train, y_train)
-    preds = model.predict(X_test)
-    acc = accuracy_score(y_test, preds)
-    joblib.dump({'model': model, 'columns': X.columns.tolist()}, MODEL_FILE)
-    return model, acc
-
-def load_model():
-    if os.path.exists(MODEL_FILE):
-        obj = joblib.load(MODEL_FILE)
-        return obj.get('model'), obj.get('columns')
-    return None, None
-
-def score_leads_in_memory(df: pd.DataFrame, model, model_cols):
-    if model is None or df.empty:
-        df['score'] = np.nan
-        return df
-    df2 = df.copy()
-    df2['age_days'] = (datetime.now() - df2['created_at']).dt.days
-    X = pd.get_dummies(df2[['source','stage']].astype(str), drop_first=False)
-    X['ad_cost'] = df2['ad_cost']
-    X['estimated_value'] = df2['estimated_value']
-    X['age_days'] = df2['age_days']
-    # align columns
-    for c in model_cols:
-        if c not in X.columns:
-            X[c] = 0
-    X = X[model_cols].fillna(0)
-    # predict_proba might exist
+def add_lead(payload):
+    s = get_session()
     try:
-        proba = model.predict_proba(X)[:, 1]
+        lead = Lead(
+            source=payload.get("source"),
+            source_details=payload.get("source_details"),
+            contact_name=payload.get("contact_name"),
+            contact_phone=payload.get("contact_phone"),
+            contact_email=payload.get("contact_email"),
+            property_address=payload.get("property_address"),
+            damage_type=payload.get("damage_type"),
+            assigned_to=payload.get("assigned_to"),
+            notes=payload.get("notes"),
+            estimated_value=float(payload.get("estimated_value") or 0.0),
+            sla_hours=int(payload.get("sla_hours") or 24),
+            sla_entered_at=payload.get("sla_entered_at") or datetime.utcnow(),
+            qualified=bool(payload.get("qualified")),
+            cost_to_acquire=float(payload.get("cost_to_acquire") or 0.0),
+            owner=payload.get("owner") or None,
+            priority_score=float(payload.get("priority_score") or 0.0),
+            time_left_hours=int(payload.get("time_left_hours") or 72)
+        )
+        s.add(lead)
+        s.commit()
+        s.refresh(lead)
+        return lead.id
     except Exception:
-        proba = model.predict(X)
-    df['score'] = proba
-    return df
+        s.rollback()
+        raise
+    finally:
+        s.close()
 
-# ----------------------------
-# SLA / Priority helpers
-# ----------------------------
-def compute_time_left_hours(created_at: pd.Timestamp):
-    if pd.isna(created_at):
-        return SLA_HOURS
-    delta = datetime.utcnow() - pd.to_datetime(created_at)
-    hours_passed = delta.total_seconds() / 3600.0
-    time_left = max(0.0, SLA_HOURS - hours_passed)
-    return time_left
+def update_lead_db(lead_id, updates, actor=None, note=None):
+    s = get_session()
+    try:
+        lead = s.query(Lead).filter(Lead.id==lead_id).first()
+        if not lead:
+            return False
+        old_status = lead.status
+        for k,v in updates.items():
+            if hasattr(lead, k):
+                setattr(lead, k, v)
+        s.add(LeadHistory(lead_id=lead_id, updated_by=actor or "", old_status=old_status, new_status=lead.status, note=note or ""))
+        s.add(lead)
+        s.commit()
+        return True
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
 
-def top_priority(df: pd.DataFrame, top_n=5):
-    if df.empty:
-        return df
-    # priority heuristic: weighted score if present else estimated_value and time left
-    if 'score' not in df.columns:
-        df['score'] = 0.0
-    df['time_left_h'] = df['created_at'].apply(compute_time_left_hours)
-    # priority = 0.6 * normalized score + 0.4 * normalized value + overdue boost
-    vals = df['estimated_value'].fillna(0.0)
-    if vals.max() > 0:
-        v_norm = vals / vals.max()
-    else:
-        v_norm = 0
-    s_norm = df['score'].fillna(0.0)
-    priority = 0.6 * s_norm + 0.4 * v_norm
-    # boost overdue items
-    priority = priority + np.where(df['time_left_h'] <= 0, 0.5, 0.0)
-    df['priority'] = priority
-    return df.sort_values('priority', ascending=False).head(top_n)
+def compute_remaining_sla_seconds(sla_entered_at, sla_hours):
+    try:
+        if sla_entered_at is None:
+            sla_entered_at = datetime.utcnow()
+        if isinstance(sla_entered_at, str):
+            sla_entered_at = datetime.fromisoformat(sla_entered_at)
+        deadline = sla_entered_at + timedelta(hours=int(sla_hours or 24))
+        remain = deadline - datetime.utcnow()
+        return max(remain.total_seconds(), 0.0), (remain.total_seconds() <= 0)
+    except Exception:
+        return float("inf"), False
 
-# ----------------------------
-# Layout & Pages
-# ----------------------------
+def compute_priority_simple(lead_row):
+    # value baseline scoring + SLA urgency
+    try:
+        val = float(lead_row.get("estimated_value") or 0.0)
+    except Exception:
+        val = 0.0
+    value_score = min(1.0, val / 5000.0)
+    sla_entered = lead_row.get("sla_entered_at") or lead_row.get("created_at")
+    try:
+        if isinstance(sla_entered, str):
+            sla_entered = datetime.fromisoformat(sla_entered)
+        deadline = sla_entered + timedelta(hours=int(lead_row.get("sla_hours") or 24))
+        time_left_h = max((deadline - datetime.utcnow()).total_seconds()/3600.0, 0.0)
+    except Exception:
+        time_left_h = 9999.0
+    sla_score = max(0.0, (72.0 - min(time_left_h, 72.0)) / 72.0)
+    return round(value_score*0.6 + sla_score*0.4, 3)
 
-# top bar with small controls: date range + alert bell
-st.markdown("<div class='topbar'><div><h2 style='margin:0'>📊 TOTAL LEAD PIPELINE KPI</h2><div class='small-muted'>Snapshot of leads and conversion across pipeline stages</div></div></div>", unsafe_allow_html=True)
+# ---------- UI CSS ----------
+st.set_page_config(page_title="Project X — UI Update", layout="wide")
+st.markdown(""" 
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Comfortaa:wght@300;400;700&display=swap');
+body, .stApp { font-family: 'Comfortaa', sans-serif; background: #ffffff; color: #0b1220; }
+.header { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid #f1f5f9; }
+.brand { font-weight:800; font-size:20px; color:#b91c1c; } /* main title red */
+.subtle { color:#64748b; font-size:13px; }
+.kpi-card { background:#000; color:#fff; padding:14px; border-radius:10px; min-height:94px; }
+.kpi-title { font-weight:700; font-size:13px; color:#fff; }
+.kpi-value { font-weight:900; font-size:20px; margin-top:8px; }
+.progress { height:8px; border-radius:8px; margin-top:8px; }
+.topbar { display:flex; gap:12px; align-items:center; }
+.alert-bell { cursor:pointer; font-size:20px; padding:8px; border-radius:8px; background:#fff; color:#111827; border:1px solid #e6e6e6; }
+.alert-badge { background:#ef4444; color:white; padding:4px 8px; border-radius:12px; font-weight:700; margin-left:6px; }
+.alert-panel { position:fixed; top:64px; right:28px; width:360px; background:#111827; color:white; padding:12px; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.2); z-index:9999; }
+.alert-row { display:flex; justify-content:space-between; align-items:center; padding:8px 6px; border-bottom:1px solid rgba(255,255,255,0.04); }
+.card-black { background:#000; color:white; padding:12px; border-radius:10px; }
+.top5-card { background:#000; color:white; padding:14px; border-radius:12px; min-height:80px; }
+.btn-primary { background:#b91c1c; color:white; padding:10px 18px; border-radius:10px; font-weight:700; border:none; width:100%; cursor:pointer; }
+.small-muted { color:#94a3b8; font-size:13px; }
+</style>
+""", unsafe_allow_html=True)
 
-col_left, col_right = st.columns([7,3])
-with col_right:
-    date_quick = st.selectbox("Quick range", ["Today", "Last 7 days", "Last 30 days", "All", "Custom"], index=3)
-    if date_quick == "Today":
-        start_date = date.today(); end_date = date.today()
-    elif date_quick == "Last 7 days":
-        start_date = date.today() - timedelta(days=6); end_date = date.today()
-    elif date_quick == "Last 30 days":
-        start_date = date.today() - timedelta(days=29); end_date = date.today()
-    elif date_quick == "All":
-        start_date = None; end_date = None
-    else:
-        start_date, end_date = st.date_input("Start - End", [date.today() - timedelta(days=6), date.today()])
-
-# Alert bell UI-only
-# compute overdue count
-df_all = load_all_leads_df()
-overdue_count = 0
-if not df_all.empty:
-    df_all['time_left_h'] = df_all['created_at'].apply(compute_time_left_hours)
-    overdue_count = int((df_all['time_left_h'] <= 0).sum())
-
-if 'alerts_open' not in st.session_state:
-    st.session_state.alerts_open = False
-
-if overdue_count > 0:
-    if st.button(f"🔔 {overdue_count} SLA alerts"):
-        st.session_state.alerts_open = not st.session_state.alerts_open
-else:
-    st.markdown("<span class='badge-small'>No SLA alerts</span>", unsafe_allow_html=True)
-
-# Sidebar navigation
-st.sidebar.title('TITAN Control Panel')
-page = st.sidebar.selectbox('Choose page', ['Dashboard','Leads','CPA','ML Lead Scoring','Imports/Exports','Settings','Reports'], index=0)
-
-# ----------------------------
-# Page: Dashboard
-# ----------------------------
-def page_dashboard(filtered_df):
-    st.markdown("<div class='card-row'>", unsafe_allow_html=True)
-
-    total_leads = len(filtered_df)
-    new_leads = int((filtered_df['stage']=='New').sum()) if not filtered_df.empty else 0
-    contacted = int((filtered_df['stage']=='Contacted').sum()) if not filtered_df.empty else 0
-    conv_rate = filtered_df['converted'].mean() if total_leads>0 else 0.0
-
-    # pipeline job value and estimate sent, inspection booked derived via stages
-    estimate_sent = int((filtered_df['stage']=='Estimate Sent').sum()) if not filtered_df.empty else 0
-    won = int((filtered_df['stage']=='Won').sum()) if not filtered_df.empty else 0
-    lost = int((filtered_df['stage']=='Lost').sum()) if not filtered_df.empty else 0
-    pipeline_value = float(filtered_df['estimated_value'].sum()) if not filtered_df.empty else 0.0
-
-    # first row (4)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(f"<div class='metric-card'><div class='kpi'>{total_leads}</div><div class='small'>Total leads</div></div>", unsafe_allow_html=True)
-    c2.markdown(f"<div class='metric-card'><div class='kpi'>{new_leads}</div><div class='small'>New leads</div></div>", unsafe_allow_html=True)
-    c3.markdown(f"<div class='metric-card'><div class='kpi'>{contacted}</div><div class='small'>Contacted</div></div>", unsafe_allow_html=True)
-    c4.markdown(f"<div class='metric-card'><div class='kpi'>{conv_rate*100:.1f}%</div><div class='small'>Conversion rate</div></div>", unsafe_allow_html=True)
-
-    # second row (3)
-    s1, s2, s3 = st.columns(3)
-    s1.markdown(f"<div class='metric-card'><div class='kpi'>{estimate_sent}</div><div class='small'>Estimates sent</div></div>", unsafe_allow_html=True)
-    s2.markdown(f"<div class='metric-card'><div class='kpi'>{won}</div><div class='small'>Won</div></div>", unsafe_allow_html=True)
-    s3.markdown(f"<div class='metric-card'><div class='kpi'>${pipeline_value:,.0f}</div><div class='small'>Pipeline job value</div></div>", unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    # Pipeline stages bar (ordered)
-    stage_counts = filtered_df['stage'].value_counts().reindex(PIPELINE_STAGES, fill_value=0).reset_index()
-    stage_counts.columns = ['stage','count']
-    st.subheader('Pipeline stages')
-    st.plotly_chart(px.bar(stage_counts, x='stage', y='count', color='stage', color_discrete_sequence=px.colors.qualitative.Dark24), use_container_width=True)
+# ---------- SIDEBAR: LOGIN & NAV ----------
+with st.sidebar:
+    st.markdown("## Account")
+    if "user" not in st.session_state:
+        st.session_state.user = None
+        st.session_state.role = "Viewer"
+    user_input = st.text_input("Username", value=st.session_state.get("user") or "")
+    if st.button("Login"):
+        if user_input.strip() == "":
+            st.warning("Enter a username")
+        else:
+            s = get_session()
+            try:
+                u = s.query(User).filter(User.username==user_input).first()
+                if not u:
+                    u = User(username=user_input, full_name=user_input, role="Admin")
+                    s.add(u); s.commit()
+                st.session_state.user = u.username
+                st.session_state.role = u.role
+                st.success(f"Signed in as {u.username} ({u.role})")
+            finally:
+                s.close()
+    if st.session_state.get("user"):
+        if st.button("Logout"):
+            st.session_state.clear()
+            st.experimental_rerun()
 
     st.markdown("---")
-    st.subheader('Top 5 Priority Leads')
-    st.markdown('*Computed from internal ML score (if available), estimate value and SLA urgency.*')
+    st.markdown("## Navigation")
+    page = st.radio("Go to", ["Pipeline Dashboard", "Leads / Capture", "Analytics", "CPA & ROI", "Settings", "Users", "Exports"], index=0)
+    st.session_state.page = page
 
-    # load model and score
-    model, model_cols = load_model()
-    scored = score_leads_in_memory(filtered_df.copy(), model, model_cols) if not filtered_df.empty else filtered_df
-    top5 = top_priority(scored, top_n=5)
-    if top5.empty:
-        st.info("No priority leads to display")
+    st.markdown("---")
+    st.markdown("## Date Range")
+    quick = st.selectbox("Quick", ["Today","Last 7 days","Last 30 days","Custom"], index=0)
+    if quick == "Today":
+        start_sel = date.today(); end_sel = date.today()
+    elif quick == "Last 7 days":
+        start_sel = date.today() - timedelta(days=6); end_sel = date.today()
+    elif quick == "Last 30 days":
+        start_sel = date.today() - timedelta(days=29); end_sel = date.today()
     else:
-        # show cards horizontally
+        dates = st.date_input("Start - End", [date.today()-timedelta(days=6), date.today()])
+        start_sel, end_sel = (dates[0], dates[1]) if isinstance(dates, (list,tuple)) else (date.today()-timedelta(days=6), date.today())
+    st.session_state.start_date = start_sel
+    st.session_state.end_date = end_sel
+
+# ensure login
+if not st.session_state.get("user"):
+    st.warning("Please sign in from the sidebar to continue.")
+    st.stop()
+
+# show selected date range text above pages (requested)
+st.markdown(f"**Selected range:** {st.session_state.start_date.isoformat()} → {st.session_state.end_date.isoformat()}")
+
+# load leads (cached)
+leads_df = load_leads(st.session_state.start_date, st.session_state.end_date)
+
+# ---------- Alert bell setup ----------
+if "alerts" not in st.session_state:
+    # initialize alerts list using current overdue leads
+    try:
+        overdue_count = int(leads_df[leads_df["status"].str.lower()=="overdue"].shape[0]) if not leads_df.empty else 0
+    except Exception:
+        overdue_count = 0
+    st.session_state.alerts = []
+    # populate example alerts so user sees them
+    if overdue_count > 0:
+        for _, r in (leads_df[leads_df["status"].str.lower()=="overdue"].head(5).iterrows() if not leads_df.empty else []):
+            st.session_state.alerts.append({"id": int(r["id"]), "msg": f"Lead #{int(r['id'])} overdue — {r.get('contact_name')}", "time": datetime.utcnow().isoformat()})
+    st.session_state.alerts_dismissed = []
+
+def render_alert_bell():
+    overdue_count = len([a for a in st.session_state.alerts if a["id"] not in st.session_state.alerts_dismissed])
+    col1, col2 = st.columns([1,8])
+    with col1:
+        if st.button("🔔", key="alert_bell"):
+            st.session_state.show_alerts = not st.session_state.get("show_alerts", False)
+    with col2:
+        if overdue_count:
+            st.markdown(f"<span class='alert-badge'>{overdue_count} overdue</span>", unsafe_allow_html=True)
+
+    if st.session_state.get("show_alerts", False):
+        # render right-hand dropdown panel
+        html = "<div class='alert-panel'>"
+        html += "<div style='display:flex;justify-content:space-between;align-items:center;'><b>🚨 SLA Alerts</b><span style='cursor:pointer;color:#fff;font-weight:800;' onclick=\"window.parent.document.querySelectorAll('[data-testid=stButton]')[0].click()\">✖</span></div><hr style='border-color:#ffffff22'/>"
+        for a in st.session_state.alerts:
+            if a["id"] in st.session_state.alerts_dismissed:
+                continue
+            html += f"<div class='alert-row'><div><b>Lead {a['id']}</b><div class='small-muted'>{a['msg']}</div></div><div><button onclick='window.parent.postMessage({{\"dismiss\":{a['id']}}}, \"*\")' class='btn'>Dismiss</button></div></div>"
+        html += "</div>"
+        st.markdown(html, unsafe_allow_html=True)
+
+# listen for dismiss messages from client (JS). Fallback: provide a dismiss UI
+# Because Streamlit can't directly receive postMessage, also provide UI to dismiss.
+if st.session_state.alerts:
+    st.markdown("**Alerts:**")
+    for a in st.session_state.alerts:
+        if a["id"] in st.session_state.alerts_dismissed:
+            continue
+        cols = st.columns([8,1])
+        cols[0].markdown(f"**Lead {a['id']}** — {a['msg']}  \n<small class='small-muted'>{a['time']}</small>", unsafe_allow_html=True)
+        if cols[1].button("X", key=f"dismiss_{a['id']}"):
+            st.session_state.alerts_dismissed.append(a["id"])
+            st.success("Alert dismissed")
+
+# ---------- PAGE: Pipeline Dashboard ----------
+if st.session_state.page == "Pipeline Dashboard":
+    st.markdown("<h1 style='color:#b91c1c'>TOTAL LEAD PIPELINE — KEY PERFORMANCE INDICATOR</h1>", unsafe_allow_html=True)
+    st.markdown("<em style='color:#6b7280'>High-level pipeline performance at a glance. Use the filters above to refine the data.</em>", unsafe_allow_html=True)
+
+    # compute KPIs
+    total_leads = int(leads_df.shape[0]) if not leads_df.empty else 0
+    qualified = int(leads_df[leads_df["qualified"]==True].shape[0]) if not leads_df.empty else 0
+    sla_success = int(leads_df["contacted"].sum()) if not leads_df.empty else 0
+    awarded_count = int(leads_df[leads_df["status"].str.lower()=="awarded"].shape[0]) if not leads_df.empty else 0
+    lost_count = int(leads_df[leads_df["status"].str.lower()=="lost"].shape[0]) if not leads_df.empty else 0
+    inspection_scheduled_count = int(leads_df[leads_df["inspection_scheduled"]==True].shape[0]) if not leads_df.empty else 0
+    estimate_sent_count = int(leads_df[leads_df["estimate_submitted"]==True].shape[0]) if not leads_df.empty else 0
+    pipeline_job_value = float(leads_df["estimated_value"].sum()) if not leads_df.empty else 0.0
+    active_leads = total_leads - (awarded_count + lost_count)
+    sla_success_pct = (sla_success / total_leads * 100) if total_leads else 0.0
+    qualification_pct = (qualified / total_leads * 100) if total_leads else 0.0
+    closed = awarded_count + lost_count
+    conversion_rate = (awarded_count / closed * 100) if closed else 0.0
+    inspection_pct = (inspection_scheduled_count / qualified * 100) if qualified else 0.0
+
+    KPI_ITEMS = [
+        ("Active Leads", f"{active_leads}", "#2563eb"),
+        ("SLA Success", f"{sla_success_pct:.1f}%", "#0ea5a4"),
+        ("Qualification Rate", f"{qualification_pct:.1f}%", "#a855f7"),
+        ("Conversion Rate", f"{conversion_rate:.1f}%", "#f97316"),
+        ("Inspections Booked", f"{inspection_pct:.1f}%", "#ef4444"),
+        ("Estimates Sent", f"{estimate_sent_count}", "#6d28d9"),
+        ("Pipeline Job Value", f"${pipeline_job_value:,.0f}", "#22c55e")
+    ]
+
+    # render KPI cards in 2 rows (4 + 3)
+    cols = st.columns(4)
+    for col, (title, value, color) in zip(cols, KPI_ITEMS[:4]):
+        pct = random.randint(30, 90)
+        col.markdown(f"<div class='kpi-card'><div class='kpi-title'>{title}</div><div class='kpi-value' style='color:{color};'>{value}</div><div class='progress' style='background:{color}; width:{pct}%;'></div></div>", unsafe_allow_html=True)
+    cols2 = st.columns(3)
+    for col, (title, value, color) in zip(cols2, KPI_ITEMS[4:]):
+        pct = random.randint(30, 90)
+        col.markdown(f"<div class='kpi-card'><div class='kpi-title'>{title}</div><div class='kpi-value' style='color:{color};'>{value}</div><div class='progress' style='background:{color}; width:{pct}%;'></div></div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("<h3 style='color:#b91c1c'>TOP 5 PRIORITY LEADS</h3>", unsafe_allow_html=True)
+    st.markdown("<em style='color:#64748b'>Highest urgency leads by priority score (0–1). Address these first.</em>", unsafe_allow_html=True)
+
+    # compute priority list and show top 5 as black cards
+    priority_list = []
+    if not leads_df.empty:
+        for _, r in leads_df.iterrows():
+            score = compute_priority_simple(r.to_dict())
+            remaining_sec, overdue = compute_remaining_sla_seconds(r.get("sla_entered_at"), r.get("sla_hours"))
+            time_left_h = int(remaining_sec // 3600) if remaining_sec not in (float("inf"), None) else 9999
+            priority_list.append({
+                "id": int(r["id"]),
+                "name": r.get("contact_name") or "No name",
+                "value": float(r.get("estimated_value") or 0.0),
+                "time_left_h": time_left_h,
+                "score": score,
+                "status": r.get("status")
+            })
+    pr_df = pd.DataFrame(priority_list).sort_values("score", ascending=False).head(5)
+    if pr_df.empty:
+        st.info("No priority leads to display.")
+    else:
         cols = st.columns(5)
-        for col, (_, r) in zip(cols, top5.iterrows()):
-            time_left_h = r.get('time_left_h', compute_time_left_hours(r['created_at']))
-            time_html = f"<div style='color:#ff6b6b;font-weight:700'>{int(time_left_h)}h left</div>" if time_left_h > 0 else "<div style='color:#ef4444;font-weight:900'>❗ OVERDUE</div>"
-            money_html = f"<div style='color:#22c55e;font-weight:900'>${float(r.get('estimated_value') or 0):,.0f}</div>"
-            col.markdown(f"<div class='lead-card'><b>#{r['lead_id']} — {r['source']}</b><br><div class='small-muted'>{r.get('notes') or ''}</div><br>{money_html}{time_html}</div>", unsafe_allow_html=True)
+        for c, (_, row) in zip(cols, pr_df.iterrows()):
+            # black top5 card
+            c.markdown(f"<div class='top5-card'><div style='font-weight:800;font-size:14px'>{row['name']}</div><div style='margin-top:6px;'><span style='color:#22c55e;font-weight:800;'>${row['value']:,.0f}</span> &nbsp;&nbsp; <span style='color:#ef4444;font-weight:700;'>{row['time_left_h']}h left</span></div></div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader('Recent Leads')
-    st.dataframe(filtered_df.sort_values('created_at', ascending=False).head(50))
+    st.markdown("<h3 style='color:#b91c1c'>All Leads (expand to edit / change status)</h3>", unsafe_allow_html=True)
+    st.markdown("<em style='color:#64748b'>Expand a lead to edit details, upload invoice, and change status.</em>", unsafe_allow_html=True)
 
-# ----------------------------
-# Page: Leads (capture & manage)
-# ----------------------------
-def page_leads():
-    st.header('Lead Capture & Management')
-    df = load_all_leads_df()
+    # Search/filter UI
+    c1, c2, c3 = st.columns([2,2,4])
+    with c1:
+        status_filter = st.selectbox("Status", options=["All"] + (sorted(leads_df["status"].dropna().unique().tolist()) if not leads_df.empty else []))
+    with c2:
+        owner_filter = st.text_input("Owner")
+    with c3:
+        q = st.text_input("Search name / phone / email / address")
 
-    with st.form('lead_form'):
-        lead_id = st.text_input('Lead ID (unique)', value=f"L{int(datetime.utcnow().timestamp())}" )
-        source = st.selectbox('Source', ['Google Ads','Organic','Referral','Facebook Ads','Direct','Partner','Other'])
-        stage = st.selectbox('Pipeline Stage', PIPELINE_STAGES)
-        est_val = st.number_input('Estimated Value', value=0.0, min_value=0.0, step=10.0)
-        ad_cost = st.number_input('Ad Cost', value=0.0, min_value=0.0, step=1.0)
-        converted = st.checkbox('Converted', value=False)
-        notes = st.text_area('Notes')
-        submitted = st.form_submit_button('Save Lead')
-        if submitted:
-            if not lead_id:
-                st.error('Lead ID required')
-            else:
-                row = {
-                    'lead_id': lead_id.strip(),
-                    'created_at': datetime.now().isoformat(),
-                    'source': source,
-                    'stage': stage,
-                    'estimated_value': float(est_val),
-                    'ad_cost': float(ad_cost),
-                    'converted': int(bool(converted)),
-                    'notes': notes or '',
-                    'score': None
-                }
-                try:
-                    upsert_lead(row)
-                    st.success('Lead captured / updated')
-                except Exception as e:
-                    st.error(f"Failed to save lead: {e}")
-    st.markdown('---')
-    st.subheader('Filter & Edit Leads')
-    df = load_all_leads_df()
-    if df.empty:
-        st.info("No leads in DB")
-        return
+    df_view = leads_df.copy() if not leads_df.empty else pd.DataFrame()
+    if not df_view.empty:
+        if status_filter and status_filter != "All":
+            df_view = df_view[df_view["status"]==status_filter]
+        if owner_filter:
+            df_view = df_view[df_view["owner"].str.contains(owner_filter, case=False, na=False)]
+        if q:
+            ql = q.lower()
+            df_view = df_view[df_view.apply(lambda r: ql in str(r["contact_name"]).lower() or ql in str(r["contact_phone"]).lower() or ql in str(r["contact_email"]).lower() or ql in str(r["property_address"]).lower(), axis=1)]
+        # display results
+        st.dataframe(df_view.sort_values("created_at", ascending=False).head(200))
+        # expanders for edit
+        for _, r in df_view.sort_values("created_at", ascending=False).head(100).iterrows():
+            with st.expander(f"Lead #{int(r['id'])} — {r.get('contact_name') or 'No name'}"):
+                colA, colB = st.columns([3,1])
+                with colA:
+                    st.write(f"**Source:** {r.get('source') or '—'}  |  **Assigned:** {r.get('owner') or '—'}")
+                    st.write(f"**Address:** {r.get('property_address') or '—'}")
+                    st.write(f"**Notes:** {r.get('notes') or '—'}")
+                    st.write(f"**Created:** {r.get('created_at')}")
+                    new_notes = st.text_area("Notes", value=r.get("notes") or "", key=f"notes_{int(r['id'])}")
+                with colB:
+                    entered = r.get("sla_entered_at") or r.get("created_at")
+                    rem_sec, overdue_flag = compute_remaining_sla_seconds(entered, r.get("sla_hours") or 24)
+                    if overdue_flag:
+                        st.markdown("<div style='color:#ef4444;font-weight:800;'>❗ OVERDUE</div>", unsafe_allow_html=True)
+                    else:
+                        hrs = int(rem_sec // 3600) if rem_sec not in (float("inf"), None) else "-"
+                        mins = int((rem_sec % 3600) // 60) if rem_sec not in (float("inf"), None) else "-"
+                        st.markdown(f"<div style='color:#ef4444;font-weight:700;'>⏳ {hrs}h {mins}m left</div>", unsafe_allow_html=True)
 
-    # filters
-    src_filter = st.multiselect('Filter by Source', options=sorted(df['source'].dropna().unique()), default=sorted(df['source'].dropna().unique()))
-    stg_filter = st.multiselect('Filter by Stage', options=PIPELINE_STAGES, default=PIPELINE_STAGES)
-    start = st.date_input("Start date", value=(date.today() - timedelta(days=30)))
-    end = st.date_input("End date", value=date.today())
-    mask = (df['created_at'] >= pd.to_datetime(start)) & (df['created_at'] <= pd.to_datetime(end) + pd.Timedelta(days=1))
-    filtered = df[mask & df['source'].isin(src_filter) & df['stage'].isin(stg_filter)]
+                new_status = st.selectbox("Status", ["New","Contacted","Inspection Scheduled","Inspection Completed","Estimate Submitted","Awarded","Lost","Overdue"], index=0, key=f"status_edit_{int(r['id'])}")
+                new_owner = st.text_input("Assigned to", value=r.get("owner") or "", key=f"owner_edit_{int(r['id'])}")
+                new_est_val = st.number_input("Job Value Estimate (USD)", value=float(r.get("estimated_value") or 0.0), min_value=0.0, step=100.0, key=f"estval_{int(r['id'])}")
+                awarded_invoice_file = st.file_uploader("Upload Invoice (Awarded)", type=["pdf","jpg","png"], key=f"inv_{int(r['id'])}")
+                # main submit button - red long
+                if st.button("💾 Update Lead", key=f"save_lead_{int(r['id'])}"):
+                    updates = {"status": new_status, "owner": new_owner, "estimated_value": float(new_est_val or 0.0), "notes": new_notes}
+                    if awarded_invoice_file is not None:
+                        path = os.path.join(UPLOAD_DIR, f"lead_{int(r['id'])}_inv_{awarded_invoice_file.name}")
+                        with open(path, "wb") as f:
+                            f.write(awarded_invoice_file.getbuffer())
+                        updates["awarded_invoice"] = path
+                    try:
+                        update_lead_db(int(r['id']), updates, actor=st.session_state.user, note="Updated via UI")
+                        st.success("Lead updated")
+                        load_leads.cache_clear()
+                    except Exception as e:
+                        st.error(f"Failed to update lead: {e}")
+                        st.write(traceback.format_exc())
 
-    st.write(f"Showing {len(filtered)} leads")
-    st.dataframe(filtered.sort_values('created_at', ascending=False).head(200))
+# ---------- PAGE: Analytics ----------
+elif st.session_state.page == "Analytics":
+    st.markdown("<h1 style='color:#b91c1c'>Lead Pipeline Analytics</h1>", unsafe_allow_html=True)
+    st.markdown("<em style='color:#64748b'>Donut shows distribution across pipeline stages. Line charts show SLA trend over time.</em>", unsafe_allow_html=True)
 
-    # quick edit: select a lead to edit
-    sel = st.selectbox("Select lead to edit", options=[''] + filtered['lead_id'].tolist())
-    if sel:
-        rec = filtered[filtered['lead_id'] == sel].iloc[0].to_dict()
-        st.markdown('### Edit lead')
-        new_stage = st.selectbox("Stage", PIPELINE_STAGES, index=PIPELINE_STAGES.index(rec['stage']) if rec['stage'] in PIPELINE_STAGES else 0)
-        new_est = st.number_input("Estimated value", value=float(rec['estimated_value'] or 0.0))
-        new_cost = st.number_input("Ad cost", value=float(rec['ad_cost'] or 0.0))
-        new_notes = st.text_area("Notes", value=rec.get('notes') or '')
-        if st.button("Update lead"):
-            try:
-                upsert_lead({
-                    'lead_id': rec['lead_id'],
-                    'created_at': rec['created_at'].isoformat() if isinstance(rec['created_at'], pd.Timestamp) else rec['created_at'],
-                    'source': rec['source'],
-                    'stage': new_stage,
-                    'estimated_value': new_est,
-                    'ad_cost': new_cost,
-                    'converted': 1 if new_stage == 'Won' else 0,
-                    'notes': new_notes,
-                    'score': rec.get('score')
-                })
-                st.success("Lead updated")
-            except Exception as e:
-                st.error("Failed to update: " + str(e))
+    if leads_df.empty:
+        st.info("No leads to analyze.")
+    else:
+        # Donut pie chart for pipeline stages
+        stage_counts = leads_df["status"].value_counts().reset_index()
+        stage_counts.columns = ["stage","count"]
+        if PLOTLY_AVAILABLE:
+            fig = px.pie(stage_counts, names="stage", values="count", hole=0.5, title="Lead Pipeline Stages (Donut)")
+            fig.update_traces(textinfo="percent+label")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.table(stage_counts)
 
-    # delete lead
-    st.markdown("---")
-    del_id = st.text_input("Lead ID to delete (type exact lead_id)")
-    if st.button("Delete lead"):
-        if del_id:
-            try:
-                delete_lead(del_id.strip())
-                st.success("Deleted (if existed)")
-            except Exception as e:
-                st.error("Failed to delete: " + str(e))
+        st.markdown("---")
+        st.markdown("### SLA / Overdue Trend (last 30 days)")
+        # simple simulated SLA trend: count overdue per day
+        today = datetime.utcnow().date()
+        days = [today - timedelta(days=i) for i in range(29, -1, -1)]
+        counts = []
+        for d in days:
+            sdt = datetime.combine(d, datetime.min.time())
+            edt = datetime.combine(d, datetime.max.time())
+            sub = leads_df[(leads_df["created_at"] >= sdt) & (leads_df["created_at"] <= edt)]
+            overdue = sub[sub["status"].str.lower()=="overdue"].shape[0]
+            counts.append(overdue)
+        import matplotlib.pyplot as plt
+        fig2 = plt.figure(figsize=(8,3))
+        plt.plot(days, counts, marker="o")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig2)
 
-# ----------------------------
-# Page: CPA & ROI
-# ----------------------------
-def page_cpa():
-    st.header("💰 CPA & ROI")
-    df = load_all_leads_df()
-    if df.empty:
-        st.info("No leads")
-        return
-    # apply date filter from top controls if set
-    # compute totals
-    total_spend = float(df['ad_cost'].sum())
-    conversions = int(df[df['stage'] == 'Won'].shape[0])
-    cpa = (total_spend / conversions) if conversions else 0.0
-    revenue = float(df[df['stage']=='Won']['estimated_value'].sum())
-    roi = revenue - total_spend
-    roi_pct = (roi / total_spend * 100) if total_spend else 0.0
+# ---------- PAGE: CPA & ROI ----------
+elif st.session_state.page == "CPA & ROI":
+    st.markdown("<h1 style='color:#b91c1c'>CPA & ROI</h1>", unsafe_allow_html=True)
+    st.markdown("<em style='color:#64748b'>Total marketing spend vs conversions and ROI. Use date selector above to filter.</em>", unsafe_allow_html=True)
 
+    total_spend = float(leads_df["cost_to_acquire"].sum()) if not leads_df.empty else 0.0
+    conversions = int(leads_df[leads_df["status"].str.lower()=="awarded"].shape[0]) if not leads_df.empty else 0
+    cpa = (total_spend / conversions) if conversions and total_spend else 0.0
+    revenue = float(leads_df[leads_df["status"].str.lower()=="awarded"]["estimated_value"].sum()) if not leads_df.empty else 0.0
+    roi_val = revenue - total_spend
+    roi_pct = (roi_val / total_spend * 100) if total_spend else 0.0
+
+    # Show metrics on black cards; titles colored differently (Red, Blue, Orange, Green)
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Marketing Spend", f"${total_spend:,.2f}")
-    col2.metric("Conversions (Won)", f"{conversions}")
-    col3.metric("CPA", f"${cpa:,.2f}")
-    col4.metric("ROI", f"${roi:,.2f} ({roi_pct:.1f}%)")
+    col1.markdown(f"<div class='card-black'><div style='color:#ef4444;font-weight:800;'>Total Marketing Spend</div><div style='font-size:20px;font-weight:900;'>${total_spend:,.2f}</div></div>", unsafe_allow_html=True)
+    col2.markdown(f"<div class='card-black'><div style='color:#3b82f6;font-weight:800;'>Conversions (Won)</div><div style='font-size:20px;font-weight:900;'>{conversions}</div></div>", unsafe_allow_html=True)
+    col3.markdown(f"<div class='card-black'><div style='color:#f97316;font-weight:800;'>CPA</div><div style='font-size:20px;font-weight:900;'>${cpa:,.2f}</div></div>", unsafe_allow_html=True)
+    col4.markdown(f"<div class='card-black'><div style='color:#22c55e;font-weight:800;'>ROI</div><div style='font-size:20px;font-weight:900;'>${roi_val:,.2f} ({roi_pct:.1f}%)</div></div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("Marketing Spend vs Conversions (by source)")
-    agg = df.groupby('source').agg(total_spend=('ad_cost','sum'), conversions=('lead_id', lambda s: df.loc[s.index,'stage'].eq('Won').sum())).reset_index()
-    if not agg.empty:
-        fig = px.bar(agg, x='source', y=['total_spend','conversions'], barmode='group', labels={'value':'Amount','source':'Source'})
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data to plot")
+    st.markdown("### Spend vs Conversions")
+    # medium size chart
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(8,4))
+    plt.bar(["Total Spend","Conversions"], [total_spend, conversions], color=["#ef4444","#2563eb"])
+    plt.title("Total Marketing Spend vs Conversions")
+    st.pyplot(fig)
 
-# ----------------------------
-# Page: ML Lead Scoring
-# ----------------------------
-def page_ml():
-    st.header("🤖 ML Lead Scoring (internal only)")
-    st.markdown("Train a RandomForest model to predict whether a lead converts. Model stored locally (`titan_lead_scoring.joblib`).")
-    df = load_all_leads_df()
-    st.write(f"Leads in DB: {len(df)}")
-    if st.button("Train model from DB"):
-        with st.spinner("Training model..."):
-            m, acc = train_model_from_db()
-            if m is None:
-                st.error(f"Training failed or insufficient classes to train: {acc}")
-            else:
-                st.success(f"Model trained (approx accuracy {acc:.3f}). Saved to `{MODEL_FILE}`.")
-    model, model_cols = load_model()
-    if model is None:
-        st.info("No pre-trained model found. Train using the button above.")
-    else:
-        st.success("Model available (internal).")
-        # Score leads and optionally persist scores to DB
-        if st.button("Score & persist lead scores"):
-            df2 = load_all_leads_df()
-            scored = score_leads_in_memory(df2.copy(), model, model_cols)
-            # persist back to DB
-            conn = get_conn()
-            cur = conn.cursor()
-            for _, r in scored.iterrows():
-                cur.execute("UPDATE leads SET score=? WHERE lead_id=?", (float(r['score']) if not np.isnan(r['score']) else None, r['lead_id']))
-            conn.commit()
-            conn.close()
-            st.success("Scores persisted to DB (score column).")
+# ---------- PAGE: Leads / Capture ----------
+elif st.session_state.page == "Leads / Capture":
+    st.markdown("<h1 style='color:#b91c1c'>Leads — Capture</h1>", unsafe_allow_html=True)
+    st.markdown("<em style='color:#64748b'>Create a lead. All inputs are saved and viewable by date.</em>", unsafe_allow_html=True)
 
-        st.subheader("Sample predictions (top probable leads)")
-        df2 = load_all_leads_df()
-        scored_preview = score_leads_in_memory(df2.copy(), model, model_cols).sort_values('score', ascending=False).head(20)
-        st.dataframe(scored_preview[['lead_id','source','stage','estimated_value','ad_cost','score']].head(20))
-
-# ----------------------------
-# Page: Imports / Exports
-# ----------------------------
-def page_imports_exports():
-    st.header("Imports & Exports")
-    st.subheader("Import leads from Excel/CSV (columns: lead_id, created_at, source, stage, estimated_value, ad_cost, converted, notes)")
-    uploaded = st.file_uploader("Upload file", type=['csv','xlsx'])
-    if uploaded is not None:
-        try:
-            if uploaded.name.lower().endswith('.csv'):
-                df_in = pd.read_csv(uploaded)
-            else:
-                df_in = pd.read_excel(uploaded)
-            # basic column checks
-            required = {'lead_id','created_at','source','stage'}
-            if not required.issubset(set(df_in.columns)):
-                st.warning(f"File missing required columns: {required - set(df_in.columns)}")
-            else:
-                # coerce columns and insert
-                df_in['created_at'] = pd.to_datetime(df_in['created_at']).astype(str)
-                insert_leads(df_in)
-                st.success("Imported (existing lead_id are ignored).")
-        except Exception as e:
-            st.error("Import failed: " + str(e))
+    with st.form("lead_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            source = st.selectbox("Lead Source", ["Google Ads","Website","Referral","Phone","Facebook","Instagram","TikTok","Other"])
+            source_details = st.text_input("Source details (UTM / notes)")
+            contact_name = st.text_input("Contact name")
+            contact_phone = st.text_input("Contact phone")
+            contact_email = st.text_input("Contact email")
+        with c2:
+            property_address = st.text_input("Property address")
+            damage_type = st.selectbox("Damage type", ["water","fire","mold","contents","reconstruction","other"])
+            assigned_to = st.text_input("Assigned to")
+            qualified_choice = st.selectbox("Is the Lead Qualified?", ["No","Yes"])
+            sla_hours = st.number_input("SLA hours (first response)", min_value=1, value=24, step=1)
+        notes = st.text_area("Notes")
+        estimated_value = st.number_input("Estimated value (USD)", min_value=0.0, value=0.0, step=100.0)
+        cost_to_acquire = st.number_input("Cost to acquire lead (USD)", min_value=0.0, value=0.0)
+        submitted = st.form_submit_button("Create Lead", help="Create a new lead")
+        if submitted:
+            payload = {
+                "source": source,
+                "source_details": source_details,
+                "contact_name": contact_name,
+                "contact_phone": contact_phone,
+                "contact_email": contact_email,
+                "property_address": property_address,
+                "damage_type": damage_type,
+                "assigned_to": assigned_to,
+                "notes": notes,
+                "estimated_value": float(estimated_value or 0.0),
+                "sla_hours": int(sla_hours),
+                "sla_entered_at": datetime.utcnow(),
+                "qualified": True if qualified_choice=="Yes" else False,
+                "cost_to_acquire": float(cost_to_acquire or 0.0),
+                "owner": assigned_to or None,
+                "priority_score": compute_priority_simple({"estimated_value": estimated_value, "sla_hours": sla_hours, "sla_entered_at": datetime.utcnow()}),
+                "time_left_hours": int(sla_hours)
+            }
+            try:
+                add_lead(payload)
+                st.success("Lead created")
+                load_leads.cache_clear()
+            except Exception as e:
+                st.error(f"Failed to create lead: {e}")
+                st.write(traceback.format_exc())
 
     st.markdown("---")
-    st.subheader("Export full leads or filtered selection")
-    df = load_all_leads_df()
+    st.subheader("Recent leads")
+    if leads_df.empty:
+        st.info("No leads yet.")
+    else:
+        st.dataframe(leads_df.sort_values("created_at", ascending=False).head(100))
+
+# ---------- PAGE: Settings ----------
+elif st.session_state.page == "Settings":
+    st.markdown("<h1 style='color:#b91c1c'>Settings</h1>", unsafe_allow_html=True)
+    st.markdown("<em style='color:#64748b'>Configure lead sources and Phase 2/3 feature toggles (placeholders).</em>", unsafe_allow_html=True)
+
+    st.markdown("### Lead Sources (visible in lead capture)")
+    platforms = ["Google Ads","Website","Referral","Facebook","Instagram","TikTok","LinkedIn","Hotline"]
+    for p in platforms:
+        st.checkbox(p, value=True, key=f"src_{p}")
+
+    st.markdown("---")
+    st.markdown("### Phase 2 / Phase 3 Feature Toggles")
+    st.checkbox("Estimate PDF generator (placeholder)", key="feature_est_pdf")
+    st.checkbox("Automated email follow-ups (placeholder)", key="feature_emails")
+    st.checkbox("Team scheduling calendar (placeholder)", key="feature_calendar")
+    st.checkbox("Internal AI recommendations (placeholder)", key="feature_ai")
+    st.markdown("These features are visible as placeholders and can be connected to backends (SMTP, calendar APIs, AI models) on request.")
+
+# ---------- PAGE: Users ----------
+elif st.session_state.page == "Users":
+    st.markdown("<h1 style='color:#b91c1c'>Users & Roles</h1>", unsafe_allow_html=True)
+    s = get_session()
+    try:
+        users = s.query(User).order_by(User.username).all()
+        if not users:
+            st.info("No users yet (users are created on login).")
+        else:
+            for u in users:
+                cols = st.columns([3,2,1])
+                new_name = cols[0].text_input("Full name", value=u.full_name or "", key=f"uname_{u.username}")
+                new_role = cols[1].selectbox("Role", ["Viewer","Estimator","Adjuster","Tech","Admin"], index=0, key=f"urole_{u.username}")
+                if cols[2].button("Save", key=f"save_{u.username}"):
+                    uu = s.query(User).filter(User.username==u.username).first()
+                    uu.full_name = st.session_state.get(f"uname_{u.username}", uu.full_name)
+                    uu.role = st.session_state.get(f"urole_{u.username}", uu.role)
+                    s.commit()
+                    st.success("Saved")
+    finally:
+        s.close()
+
+# ---------- PAGE: Exports ----------
+elif st.session_state.page == "Exports":
+    st.markdown("<h1 style='color:#b91c1c'>Exports</h1>", unsafe_allow_html=True)
+    df = leads_df.copy()
     if df.empty:
-        st.info("No leads in DB")
+        st.info("No leads to export.")
     else:
-        if st.button("Export all leads (Excel)"):
-            html = download_link(df, 'all_leads.xlsx')
-            st.markdown(html, unsafe_allow_html=True)
-        st.markdown("Or export filtered leads from the Leads page (use filters).")
-
-# ----------------------------
-# Page: Settings
-# ----------------------------
-def page_settings():
-    st.header("Settings")
-    st.markdown("Configure app behavior and pipeline stages (static for now).")
-    st.markdown("SLA hours (used for 'time left'):")
-    global SLA_HOURS
-    SLA_HOURS = st.number_input("SLA hours", value=SLA_HOURS, min_value=1, max_value=168, step=1)
-
-# ----------------------------
-# Page: Reports
-# ----------------------------
-def page_reports():
-    st.header("Reports")
-    df = load_all_leads_df()
-    if df.empty:
-        st.info("No leads")
-        return
-    st.subheader("SLA / Overdue Trend (last 30 days)")
-    today = datetime.utcnow().date()
-    days = [today - timedelta(days=i) for i in range(29, -1, -1)]
-    counts = []
-    for d in days:
-        start = datetime.combine(d, datetime.min.time())
-        end = datetime.combine(d, datetime.max.time())
-        subset = df[(df['created_at'] >= start) & (df['created_at'] <= end)]
-        overdue_count = int(((subset['created_at'].apply(lambda x: compute_time_left_hours(x)) <= 0)).sum())
-        counts.append(overdue_count)
-    trend = pd.DataFrame({'date': days, 'overdue': counts})
-    st.line_chart(trend.set_index('date'))
-
-    st.markdown('---')
-    st.subheader('Stage counts (table)')
-    st.table(df['stage'].value_counts().reindex(PIPELINE_STAGES, fill_value=0))
-
-# ----------------------------
-# Render pages
-# ----------------------------
-# apply date filters to data functions that accept date range
-if start_date is None and end_date is None:
-    df_filtered = load_all_leads_df()
-else:
-    df_tmp = load_all_leads_df()
-    if df_tmp.empty:
-        df_filtered = df_tmp
-    else:
-        start_dt = pd.to_datetime(start_date)
-        end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1)
-        df_filtered = df_tmp[(df_tmp['created_at'] >= start_dt) & (df_tmp['created_at'] <= end_dt)]
-
-# show alerts dropdown if toggled
-if st.session_state.get('alerts_open', False):
-    st.subheader(f"SLA Alerts ({overdue_count})")
-    overdue_df = df_all[df_all['time_left_h'] <= 0] if not df_all.empty else pd.DataFrame()
-    if overdue_df.empty:
-        st.info("No overdue leads")
-    else:
-        for _, r in overdue_df.sort_values('created_at').iterrows():
-            st.markdown(f"<div class='lead-card'><b>{r['lead_id']} • {r['source']}</b> — <span style='color:#22c55e'>${float(r['estimated_value'] or 0):,.0f}</span> <span style='float:right;color:#ef4444'>OVERDUE</span><br><div class='small-muted'>{r.get('notes') or ''}</div></div>", unsafe_allow_html=True)
-
-if page == 'Dashboard':
-    page_dashboard(df_filtered)
-elif page == 'Leads':
-    page_leads()
-elif page == 'CPA':
-    page_cpa()
-elif page == 'ML Lead Scoring':
-    page_ml()
-elif page == 'Imports/Exports':
-    page_imports_exports()
-elif page == 'Settings':
-    page_settings()
-elif page == 'Reports':
-    page_reports()
-else:
-    st.info("Page not found")
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download leads.csv", data=csv, file_name="leads_export.csv", mime="text/csv")
 
 # Footer
 st.markdown("---")
-st.markdown("<div class='small-muted'>TITAN — single-file Streamlit lead pipeline · SQLite persistence · ML scoring (internal)</div>", unsafe_allow_html=True)
+st.markdown("<div class='small-muted'>Project X — UI Update (Comfortaa font) · Built for restoration pipeline</div>", unsafe_allow_html=True)
