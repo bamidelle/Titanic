@@ -21,6 +21,12 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import OperationalError
 
+# Temporary compatibility patch — prevents crashes from deprecated rerun calls
+import streamlit as st
+if not hasattr(st, "experimental_rerun"):
+    st.experimental_rerun = st.rerun
+
+
 # Optional ML imports
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
