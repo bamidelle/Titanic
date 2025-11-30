@@ -545,7 +545,7 @@ if page == "Dashboard":
     st.markdown("*High-level pipeline performance at a glance. Use the date range in the left panel.*")
     df = df_main.copy()
     total_leads = len(df)
-    awarded = len(df[df["stage"] == "Won"])
+    # ✅ FIXED SAFE COUNT WITH FALLBACK FOR MISSING COLUMN if "stage" in df.columns:     # ✅ FIXED SAFE COUNT WITH FALLBACK FOR MISSING COLUMN if "stage" in df.columns:     awarded = len(df[df["stage"] == "Won"]) else:     awarded = 0     st.warning("⚠ Pipeline column 'stage' not found in DB read. Check DB structure.") else:     awarded = 0     st.warning("⚠ Pipeline column 'stage' not found in DB read. Check DB structure.")
     lost = len(df[df["stage"] == "Lost"])
     active_leads = total_leads - (awarded + lost)
     sla_success_pct = (len(df[df["stage"]=="Contacted"]) / total_leads * 100) if total_leads else 0.0
