@@ -3,7 +3,7 @@ import random
 from datetime import datetime, timedelta, date
 import pandas as pd
 import plotly.express as px
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from sklearn.linear_model import LogisticRegression
 from sklearn.compose import ColumnTransformer
@@ -13,333 +13,292 @@ import joblib
 import os
 
 # ---------- CONFIG ----------
-st.set_page_config(page_title="Titan Restoration", layout="wide")
+st.set_page_config(page_title="Titan Restoration CRM", layout="wide")
 
-# Inject global styles
+# ---------- GLOBAL FONT & STYLE ----------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Comfortaa:wght@300;400;600&display=swap');
+
 html, body, [class*="css"]  {
     font-family: 'Comfortaa', sans-serif;
     background: white;
 }
+
 .metric-card {
     background:#000;
     color:white;
     padding:16px;
     border-radius:12px;
-    box-shadow:0 2px 6px rgba(0,0,0,0.1);
     margin-bottom:12px;
 }
+
 .metric-title {
-    font-size:14px;
-    font-weight:600;
+    font-size:15px;
+    font-weight:bold;
     color:white;
 }
+
 .metric-value {
-    font-size:26px;
-    font-weight:600;
+    font-size:24px;
+    font-weight:bold;
     margin-top:6px;
 }
+
 .progress-bar {
-  height:6px;
+  height:7px;
   border-radius:4px;
-  margin-top:12px;
+  margin-top:10px;
 }
+
 .priority-money {
-  font-size:20px;
-  font-weight:600;
-  color:#22c55e; /* green */
+  font-size:17px;
+  font-weight:bold;
+  color:green;
 }
+
 .priority-time {
-  font-size:15px;
-  font-weight:600;
-  color:#ef4444; /* red */
+  font-size:13px;
+  font-weight:bold;
+  color:red;
 }
-.submit-btn > button {
-    width:100%;
-    background:#ef4444;
-    border:none;
-    padding:14px;
-    border-radius:8px;
-    font-size:18px;
-    font-weight:600;
-    color:white;
-}
-.lead-chip {
-  display:inline-block;
-  padding:8px 14px;
-  background:#000;
-  color:#fff;
-  border-radius:6px;
-  font-size:14px;
-  margin:4px 0;
-}
+
 .alert-panel {
   background:#000;
-  padding:12px 18px;
+  padding:12px 16px;
   border-radius:8px;
   color:white;
-  font-size:15px;
-  font-weight:600;
+  font-weight:bold;
   display:flex;
   justify-content:space-between;
   align-items:center;
-  margin:16px 0;
 }
-.close-btn {
-  cursor:pointer;
-  font-size:18px;
-  color:white;
-}
-.spend-chart-container {
-  margin-top:18px;
-}
-.sidebar-button {
-  background:#000;
-  color:white;
-  padding:10px;
-  border-radius:6px;
-  text-align:center;
-  margin-bottom:6px;
+
+.submit-btn > button {
+    width:100%;
+    background:red;
+    border:none;
+    padding:14px;
+    border-radius:8px;
+    font-size:16px;
+    font-weight:600;
+    color:white;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- DATABASE ----------
-engine = create_engine("sqlite:///titan_restoration.db", connect_args={"check_same_thread": False})
+# ---------- CLOUD SAFE DB DIRECTORY ----------
+CLOUD_DB_PATH = "/home/adminuser/data"
+os.makedirs(CLOUD_DB_PATH, exist_ok=True)
+
+# ---------- DATABASE ENGINE ----------
+DATABASE_URL = f"sqlite:///{CLOUD_DB_PATH}/restoration.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = scoped_session(sessionmaker(bind=engine, expire_on_commit=False))
 Base = declarative_base()
 
-# ---------- MODELS ----------
-class Lead(Base):
-    __tablename__ = "leads"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String)
-    phone = Column(String)
-    email = Column(String)
-    address = Column(String)
-    source = Column(String)
-    cost_to_acquire = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    inspection_date = Column(DateTime, nullable=True)
-    estimate_value = Column(Float, default=0.0)
-    status = Column(String, default="CAPTURED")
-    converted = Column(Boolean, default=False)
-    owner = Column(String, default="UNASSIGNED")
-    score = Column(Integer, default=50)
-    time_left = Column(Integer, default=48)
+# ---------- INITIAL TABLES ----------
+with engine.connect() as conn:
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        full_name TEXT,
+        role TEXT,
+        alerts_enabled INTEGER,
+        created_at TEXT
+    );
+    """))
 
-class LeadHistory(Base):
-    __tablename__ = "lead_history"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    lead_id = Column(Integer)
-    updated_by = Column(String)
-    updated_at = Column(DateTime, default=datetime.utcnow)
-    old_status = Column(String)
-    new_status = Column(String)
-    note = Column(String)
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        phone TEXT,
+        email TEXT,
+        address TEXT,
+        source TEXT,
+        cost_to_acquire REAL,
+        status TEXT,
+        owner TEXT,
+        estimate_value REAL,
+        inspection_date TEXT,
+        created_at TEXT,
+        converted INTEGER,
+        score INTEGER,
+        time_left INTEGER
+    );
+    """))
 
-class User(Base):
-    __tablename__ = "users"
-    username = Column(String, primary_key=True)
-    full_name = Column(String, default="")
-    role = Column(String, default="Viewer")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    alerts_enabled = Column(Boolean, default=True)
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS lead_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER,
+        updated_by TEXT,
+        old_status TEXT,
+        new_status TEXT,
+        note TEXT,
+        updated_at TEXT
+    );
+    """))
 
-Base.metadata.create_all(engine)
-
-# Utility: fetch leads in date range
-@st.cache_data(ttl=10)
-def get_leads(start_date, end_date):
-    s = SessionLocal()
-    leads = s.query(Lead).filter(
-        Lead.created_at >= datetime.combine(start_date, datetime.min.time()),
-        Lead.created_at <= datetime.combine(end_date, datetime.max.time())
-    ).all()
-    s.close()
-    return leads
-
-# Utility: silent internal ML train
-MODEL_FILE = "internal_ml_model.pkl"
-def silent_train_ml():
-    s = SessionLocal()
-    leads = s.query(Lead).all()
-    s.close()
-    if not leads:
-        return None
-    X = pd.DataFrame([{"spend":l.cost_to_acquire, "value":l.estimate_value, "source":l.source} for l in leads])
-    y = [1 if l.converted else 0 for l in leads]
-
-    pre = ColumnTransformer([
-        ("num", StandardScaler(), ["spend","value"]),
-        ("cat", OneHotEncoder(handle_unknown="ignore"), ["source"])
-    ])
-    model = make_pipeline(pre, LogisticRegression(max_iter=1000))
-    model.fit(X, y)
-    joblib.dump(model, MODEL_FILE)
-    return model
-
-def load_ml_model():
-    if os.path.exists(MODEL_FILE):
-        return joblib.load(MODEL_FILE)
-    return silent_train_ml()
-
-# ---------- AUTH SECTION ----------
+# ---------- LOGIN ----------
 if "user" not in st.session_state:
     st.session_state.user = None
-    st.session_state.role = "Viewer"
-    st.session_state.page = "pipeline"
+    st.session_state.role = None
+    st.session_state.page = "Pipeline"
 
 if not st.session_state.user:
     u = st.sidebar.text_input("Username")
     if st.sidebar.button("Login"):
-        s = SessionLocal()
-        x = s.query(User).filter(User.username==u).first()
-        if not x:
-            x = User(username=u, full_name=u, role="Viewer")
-            s.add(x)
-            s.commit()
-        st.session_state.user = x.username
-        st.session_state.role = x.role
-        s.close()
+        with engine.connect() as conn:
+            res = conn.execute(text("SELECT * FROM users WHERE username = :u"), {"u":u}).fetchone()
+            if not res:
+                conn.execute(text("""
+                INSERT INTO users (username, full_name, role, alerts_enabled, created_at)
+                VALUES (:u, :u, 'Viewer', 1, :d)
+                """), {"u":u, "d":datetime.utcnow().isoformat()})
+
+        st.session_state.user = u
+        with engine.connect() as conn:
+            role = conn.execute(text("SELECT role FROM users WHERE username=:u"), {"u":u}).scalar()
+            st.session_state.role = role
         st.rerun()
+
     else:
+        st.info("Please login to load your workspace.")
         st.stop()
 
 if st.sidebar.button("Logout"):
     st.session_state.clear()
     st.rerun()
 
-# ---------- PAGE ROUTER ----------
-page = st.session_state.page
+# ---------- PAGE TITLES ----------
+page = st.session_state.get("page", "Pipeline")
 
-# ---------- PIPELINE PAGE ----------
-if page == "pipeline":
-    st.markdown("## 🧾 Lead Pipeline")
-    st.markdown("_Overview of lead pipeline performance_")
+st.markdown(f"<h1 style='color:#000'>{page.upper()}</h1>", unsafe_allow_html=True)
 
-    st.markdown("### 📅 Select timeline")
-    col_a, col_b, col_c = st.columns([1,1,3])
-    start = col_a.date_input("Start", date.today())
-    end = col_b.date_input("End", date.today())
+# ---------- DATE FILTER ON PAGE ----------
+st.markdown("### 📅 Filter Leads By Date")
+col1, col2 = st.columns([1,1])
+start_date = col1.date_input("Start Date", date.today())
+end_date = col2.date_input("End Date", date.today())
 
-    leads = get_leads(start, end)
+# ---------- FUNCTIONS ----------
+@st.cache_data(ttl=5)
+def load_leads(start_date, end_date):
+    with engine.connect() as conn:
+        leads = conn.execute(text("""
+        SELECT * FROM leads 
+        WHERE created_at BETWEEN :start AND :end
+        """), {"start":start_date.isoformat(), "end":end_date.isoformat()}).fetchall()
+    return leads
 
-    active_leads = sum(1 for l in leads if not l.converted)
-    sla_success = random.randint(80, 100)
-    qualification_rate = round(random.uniform(60, 95),1)
-    conversion_rate = round(random.uniform(8, 30),1)
-    inspection_booked = sum(1 for l in leads if l.inspection_date)
-    estimate_sent = sum(1 for l in leads if l.status=="ESTIMATE_SENT")
-    pipeline_val = sum(l.estimate_value for l in leads if not l.converted)
-    overdue_leads = [l for l in leads if l.status=="OVERDUE"]
+def add_lead(name, phone, email, address, source, cost):
+    with engine.connect() as conn:
+        conn.execute(text("""
+        INSERT INTO leads (name, phone, email, address, source, cost_to_acquire, status, owner, created_at, converted, score, time_left)
+        VALUES (:name, :phone, :email, :address, :source, :cost, 'CAPTURED', 'UNASSIGNED', :d, 0, :score, :tl)
+        """), {"name":name, "phone":phone, "email":email, "address":address, "source":source, "cost":cost or 0, "d":datetime.utcnow().isoformat(), "score":random.randint(40,100), "tl":48})
 
-    data = [
-        ("Active Leads", active_leads),
-        ("SLA Success", f"{sla_success}%"),
-        ("Qualification", f"{qualification_rate}%"),
-        ("Conversion", f"{conversion_rate}%"),
-        ("Inspections", inspection_booked),
-        ("Estimates Sent", estimate_sent),
-        ("Pipeline Value", f"${pipeline_val:,.2f}")
-    ]
+def update_lead(id, status, owner, spend, value, tl):
+    with engine.connect() as conn:
+        old = conn.execute(text("SELECT status FROM leads WHERE id=:id"),{"id":id}).scalar()
 
-    df_priority = pd.DataFrame([{"Name":l.name, "Value":l.estimate_value, "Time":l.time_left} for l in overdue_leads])
-    df_priority = df_priority.sort_values("Value",ascending=False).head(5)
+        conn.execute(text("""
+        UPDATE leads 
+        SET status=:status, owner=:owner, cost_to_acquire=:spend, estimate_value=:value, converted=:conv, time_left=:tl
+        WHERE id=:id
+        """), {"id":id, "status":status, "owner":owner, "spend":spend or 0, "value":value or 0, "conv":1 if status=="AWARDED" else 0, "tl":tl or 48})
 
-    # KPI Cards - 2 rows
-    rows = st.columns(4) + st.columns(3)
-    for c,(title,val) in zip(rows,data):
-        num_color = random.choice(["#3b82f6","#22d3ee","#f97316","#facc15","#c084fc","#34d399","#60a5fa"])
-        pct = random.randint(30, 90)
-        bar_color = random.choice(["cyan","green","orange","blue","purple","pink","yellow"])
-        c.markdown(f"""
-        <div class='metric-card'>
-            <div class='metric-title'>{title}</div>
-            <div class='metric-value' style="color:{num_color}">{val}</div>
-            <div class='progress-bar' style="background:{bar_color}; width:{pct}%"></div>
-        </div>
-        """, unsafe_allow_html=True)
+        conn.execute(text("""
+        INSERT INTO lead_history (lead_id, updated_by, old_status, new_status, updated_at)
+        VALUES (:id, :user, :old, :new, :d)
+        """), {"id":id, "user":st.session_state.user, "old":old, "new":status, "d":datetime.utcnow().isoformat()})
 
-    # Top 5 priority section
-    st.markdown("### ⭐ TOP 5 PRIORITY LEADS")
-    pcols = st.columns(5)
-    for c,l in zip(pcols, df_priority.to_dict("records")):
-        c.markdown(f"""
-        <div class='metric-card'>
-            <div style="color:{random.choice(["red","orange","blue","green","purple"])}; font-size:15px; font-weight:600;">{l['Name']}</div>
-            <div class='priority-money'>${l['Value']:,.2f}</div>
-            <div class='priority-time'>{l['Time']} hrs left</div>
-        </div>
-        """, unsafe_allow_html=True)
+def get_stage_counts():
+    with engine.connect() as conn:
+        df = pd.read_sql("SELECT status, COUNT(*) AS count FROM leads GROUP BY status", conn)
+    return df
 
-    # All leads expansion
-    st.markdown("### 📚 All Leads")
-    for l in leads:
-        hist = []
-        s = SessionLocal()
-        h = s.query(LeadHistory).filter(LeadHistory.lead_id==l.id).all()
-        for x in h:
-            hist.append(f"{x.updated_by} changed {x.old_status} → {x.new_status} at {x.updated_at}")
-        s.close()
+# ---------- LEAD CAPTURE UI ----------
+if page == "Lead Capture":
+    st.text_input("Lead Name", "", key="lname")
+    st.text_input("Phone", "", key="lphone")
+    st.text_input("Email", "", key="lemail")
+    st.text_area("Address", "", key="laddr")
+    st.selectbox("Lead Source", ["Website","Referral","Facebook","Instagram","Hotline","Walk-In","TikTok","Google Ads"], key="lsrc")
+    st.number_input("Cost to Acquire ($0 default)", 0.0, key="lcost")
 
-        with st.expander(f"Lead #{l.id} — {l.name}"):
-            st.text(f"Source: {l.source}")
-            st.text(f"Spend: ${l.cost_to_acquire:.2f}")
-            st.text(f"Value: ${l.estimate_value:.2f}")
-            st.text(f"Owner: {l.owner}")
-            st.text(f"Score: {l.score}")
-            st.write("Audit trail:")
-            for x in hist:
-                st.text(x)
+    if st.button("Submit Lead", key="submit_lead"):
+        add_lead(st.session_state.lname, st.session_state.lphone, st.session_state.lemail, st.session_state.laddr, st.session_state.lsrc, st.session_state.lcost)
+        st.success("✅ Lead submitted and saved!")
 
-# ---------- ANALYTICS PAGE ----------
-elif page == "analytics":
-    st.markdown("## 📊 Analytics")
-    leads = get_leads(date.today(),date.today())
-    if leads:
-        df = pd.DataFrame([{"Name":l.name,"Stage":l.status,"Owner":l.owner,"Spend":l.cost_to_acquire,"Value":l.estimate_value,"Time":l.time_left} for l in leads])
-    else:
-        df = pd.DataFrame()
-
-    st.markdown("### Pipeline Stages (Donut)")
-    if not df.empty:
-        fig = px.pie(df, names="Stage", hole=0.6)
+# ---------- PIPELINE DASHBOARD ----------
+elif page == "Pipeline":
+    df_stage = get_stage_counts()
+    if not df_stage.empty:
+        fig = px.pie(df_stage, names="status", values="count", hole=0.5)
         st.plotly_chart(fig, use_container_width=False)
 
-# ---------- CPA / ROI PAGE ----------
-elif page == "cpa":
-    st.markdown("## 💰 CPA & ROI")
-    leads = get_leads(date.today(),date.today())
-    spend = sum(l.cost_to_acquire for l in leads)
-    won = sum(1 for l in leads if l.converted)
+    leads = load_leads(start_date, end_date)
+
+    df_top = pd.DataFrame(leads, columns=["id","name","estimate_value","time_left"]).sort_values("estimate_value", ascending=False).head(5)
+
+    st.markdown("### ⭐ TOP 5 PRIORITY LEADS")
+    pcols = st.columns(5)
+    for col,(_,row) in zip(pcols, df_top.iterrows()):
+        col.markdown(f"""
+        <div class='metric-card'>
+            <div class='metric-title' style='color:{random.choice(["red","blue","orange","green","purple"])}'>{row['name']}</div>
+            <div class='priority-money'>${row['estimate_value']:,.2f}</div>
+            <div class='priority-time'>{row['time_left']} hrs left</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 📚 ALL LEADS")
+    for l in leads:
+        with st.expander(f"Lead #{l[0]} — {l[1]}"):
+            st.selectbox("Assign Owner", ["Admin","Estimator","Adjuster","Tech","Viewer","UNASSIGNED"], key=f"own_{l[0]}")
+            st.selectbox("Change Stage", ["CAPTURED","QUALIFIED","INSPECTED","ESTIMATE_SENT","AWARDED","OVERDUE"], key=f"stg_{l[0]}")
+            st.number_input("Spend", l[6], key=f"sp_{l[0]}")
+            st.number_input("Estimate Value", l[8], key=f"val_{l[0]}")
+            st.slider("Time left", 1, 96, l[10], key=f"tl_{l[0]}")
+
+            if st.button("Save Lead", key=f"save_{l[0]}"):
+                update_lead(l[0], st.session_state[f"stg_{l[0]}"], st.session_state[f"own_{l[0]}"], st.session_state[f"sp_{l[0]}"], st.session_state[f"val_{l[0]}"], st.session_state[f"tl_{l[0]}"])
+
+                st.success("✅ Lead updated & audit saved!")
+
+# ---------- ANALYTICS DASHBOARD ----------
+elif page == "Analytics":
+    df_stage = get_stage_counts()
+    if not df_stage.empty:
+        line = px.line(df_stage, x="status", y="count")
+        st.plotly_chart(line, use_container_width=True)
+
+# ---------- CPA/ROI ----------
+elif page == "CPA/ROI":
+    leads = load_leads(date.today(),date.today())
+    spend = 0
+    won = 0
+    revenue = 0
+    for l in leads:
+        spend += l[6] or 0
+        revenue += l[8] if l[7]=="AWARDED" else 0
+        won += 1 if l[9]==1 else 0
+
     cpa = spend/won if won else 0
-    roi = sum(l.estimate_value for l in leads if l.converted) - spend
+    roi = revenue-spend
     roi_pct = (roi/spend*100) if spend else 0
 
-    c1,c2 = st.columns(2)
-    c1.markdown("<div class='metric-card'><div class='metric-title' style='color:red;'>Total Marketing Spend</div><div class='metric-value' style='color:white;'>${:,.2f}</div></div>".format(spend),unsafe_allow_html=True)
-    c2.markdown("<div class='metric-card'><div class='metric-title' style='color:green;'>Conversions (Won)</div><div class='metric-value' style='color:white;'>{}</div></div>".format(won),unsafe_allow_html=True)
+    st.markdown("### KPIs")
+    c1,c2,c3 = st.columns(3)
+    c1.markdown("<div class='metric-card'><div style='color:red'>Total Spend</div>${:,.2f}</div>".format(spend),unsafe_allow_html=True)
+    c2.markdown("<div class='metric-card'><div style='color:blue'>Conversions (Won)</div>{}</div>".format(won),unsafe_allow_html=True)
+    c3.markdown("<div class='metric-card'><div style='color:green'>ROI</div>${:,.2f} ({:,.1f}%)</div>".format(roi,roi_pct),unsafe_allow_html=True)
 
-    st.markdown(f"<p style='font-size:20px;'><span style='color:red;'>🎯 CPA:</span> <span style='color:blue;'>${cpa:,.2f}</span></p>",unsafe_allow_html=True)
-    st.markdown(f"<p style='font-size:20px;'><span style='color:orange;'>📈 ROI:</span> <span style='color:green;'>${roi:,.2f} ({roi_pct:,.1f}%)</span></p>",unsafe_allow_html=True)
-
-    st.markdown("### 💹 Spend vs Conversions")
-    s_cols = st.columns([1,3,1])
-    fig = px.line(x=["Spend","Conversions"], y=[spend,won])
-    s_cols[1].plotly_chart(fig, use_container_width=False)
-
-# ---------- SETTINGS ----------
-elif page == "settings":
-    st.markdown("## ⚙ Settings")
-    st.selectbox("Default Role",["Viewer","Estimator","Adjuster","Tech","Admin"])
-    st.selectbox("Allowed Sources",["Website","Hotline","Facebook","Instagram","TikTok","Google Ads","Referral"])
-
-# ---------- PROFILE ----------
-elif page == "profile":
-    st.markdown("## 👤 User Profile")
-    st.text_input("Full Name", st.session_state.user)
-    st.selectbox("Role",["Viewer","Estimator","Adjuster","Tech","Admin"])
-    st.toggle("Alerts enabled", True)
+    if not df.empty:
+        fig = plt.figure(figsize=(4,2))
+        plt.plot(["Spend","Won"], [spend,won])
+        st.pyplot(fig, use_container_width=False)
