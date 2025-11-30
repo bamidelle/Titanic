@@ -1,3 +1,8 @@
+# ✅ PERMANENT FIX: Redirect removed/deprecated Streamlit rerun API
+import streamlit as st
+if not hasattr(st, "experimental_rerun"):
+    st.experimental_rerun = st.rerun
+
 # titan_final_c.py
 """
 TITAN — Single-file Streamlit app (Option C: DB in script folder)
@@ -864,6 +869,11 @@ elif page == "Audit Trail":
             st.dataframe(pd.DataFrame(data))
     finally:
         s.close()
+
+# ✅ backup rerun patch if called anywhere accidentally
+if hasattr(st, "experimental_rerun"):
+    st.experimental_rerun = st.rerun
+
 
 # Footer
 st.markdown("---")
