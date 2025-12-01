@@ -626,4 +626,4 @@ def page_pipeline_board():
         st.info("No leads yet. Create one in Lead Capture.")
     else:
         stage_counts = df["stage"].value_counts().reindex(PIPELINE_STAGES, fill_value=0)
-        pie_df = pd.DataFrame({"status": stage_counts}
+        pie_df = pd.DataFrame({"status": stage_counts})
