@@ -686,7 +686,7 @@ with st.sidebar:
         index=0
     )
 
-)
+
 
     st.markdown("---")
     st.markdown("Date range for reports")
