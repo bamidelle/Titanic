@@ -1105,109 +1105,104 @@ def page_ml_internal():
 
 # ---------- BEGIN BLOCK G: AI RECOMMENDATIONS PAGE ----------
 def page_ai_recommendations():
-   
-    """AI Recommendations — cleaned, safe, and optimized."""
-def page_ai_recommendations():
-    st.markdown("<div class='header'>🤖 AI Recommendations</div>", unsafe_allow_html=True)
+    """
+    Advanced AI Recommendations page (Option B).
+    - Safe: validates data & prevents duplicate-column crashes
+    - Uses internal model if available: load_internal_model(), score_dataframe()
+    - Uses DB for technician workload: InspectionAssignment
+    """
+    import plotly.express as px
+    from sqlalchemy import func
+    from datetime import datetime
 
-    # ALWAYS refresh live data
-    df = leads_to_df()
+    st.markdown("<div class='header'>🤖 AI Recommendations — Advanced</div>", unsafe_allow_html=True)
+    st.markdown("<em>Predictive insights, pipeline bottlenecks, technician workload, and recommended actions.</em>", unsafe_allow_html=True)
+
+    # 0) Load and validate data
+    try:
+        df = leads_to_df()
+    except Exception as e:
+        st.error("Failed to load leads: " + str(e))
+        return
 
     if df is None or df.empty:
-        st.warning("No lead data available. Please add leads first.")
+        st.info("No lead data available. Add leads first or check DB.")
         return
 
-    # Ensure required columns exist
-    required = ["stage", "estimated_value", "created_at"]
+    # Ensure required columns exist (provide helpful error if missing)
+    required = ["lead_id", "stage", "estimated_value", "created_at"]
     for col in required:
         if col not in df.columns:
-            st.error(f"Missing required column: {col}")
+            st.error(f"Missing required column for AI analysis: {col}")
             return
 
-
-    # 1) Top overdue leads
-    st.subheader("Top Overdue Leads")
-    overdue_list = []
-    for _, r in df.iterrows():
-        rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
-        if overdue_flag and r.get("stage") not in ("Won", "Lost"):
-            overdue_list.append({
-                "lead_id": r["lead_id"],
-                "stage": r.get("stage"),
-                "assigned_to": r.get("assigned_to"),
-                "value": r.get("estimated_value") or 0.0,
-                "overdue_seconds": rem_s
-            })
-    if overdue_list:
-        over_df = pd.DataFrame(overdue_list).sort_values("value", ascending=False)
-        # keep columns unique and friendly
-        over_df = over_df.rename(columns={"lead_id": "Lead ID", "stage": "Stage", "assigned_to": "Assigned To", "value": "Est. Value", "overdue_seconds": "Overdue Seconds"})
-        st.table(over_df[["Lead ID", "Stage", "Assigned To", "Est. Value"]].head(10))
-    else:
-        st.info("No overdue leads.")
-
-    st.markdown("---")
-
-def page_ai_recommendations():
-    st.header("AI Recommendations")
-
-    # 1) Ensure the DataFrame exists and has the 'stage' column
-    if 'df' not in globals() or df.empty:
-        st.warning("No data available.")
-        return
-
-    if 'stage' not in df.columns:
-        st.warning("The 'stage' column is missing in your dataset.")
-        return
-
-    # 2) Pipeline Bottlenecks (stage counts)
-    st.subheader("Pipeline Bottlenecks")
-
-    # Convert Series → clean DataFrame with unique columns
-    stage_counts = (
-        df["stage"]
-        .value_counts()
-        .reset_index()
-        .rename(columns={"index": "Stage", "stage": "Count"})
-    )
-
-    # Show top 10 stages
-    st.table(stage_counts.head(10))
-
-    # Identify bottleneck stage safely
-    bottleneck = stage_counts.sort_values("Count", ascending=False).iloc[0] if not stage_counts.empty else None
-
-    if bottleneck is not None:
-        st.success(f"Pipeline bottleneck stage: **{bottleneck['Stage']}** ({bottleneck['Count']} leads)")
-    else:
-        st.info("No bottleneck stage found.")
-
-    # Add more AI recommendation logic here if needed
-
-
-
-    # Small horizontal bar chart (plotly)
+    # Normalize types lightly
+    df = df.copy()
     try:
-        fig = px.bar(stage_df, x="Count", y="Stage", orientation="h", title="Leads by Stage", height=300)
-        fig.update_layout(margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        df["estimated_value"] = pd.to_numeric(df["estimated_value"].fillna(0))
     except Exception:
         pass
 
+    # ---------- 1) Top Overdue Leads ----------
+    st.subheader("Top Overdue Leads")
+    overdue_rows = []
+    for _, r in df.iterrows():
+        rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
+        if overdue_flag and r.get("stage") not in ("Won", "Lost"):
+            overdue_rows.append({
+                "lead_id": r["lead_id"],
+                "stage": r.get("stage"),
+                "assigned_to": r.get("assigned_to") or "",
+                "estimated_value": float(r.get("estimated_value") or 0.0),
+                "overdue_seconds": rem_s or 0
+            })
+    if overdue_rows:
+        over_df = pd.DataFrame(overdue_rows).sort_values(["estimated_value","overdue_seconds"], ascending=[False,True])
+        # keep safe columns and unique names
+        over_df = over_df.rename(columns={"lead_id":"Lead ID","stage":"Stage","assigned_to":"Assigned To","estimated_value":"Est. Value","overdue_seconds":"Overdue Seconds"})
+        st.table(over_df[["Lead ID","Stage","Assigned To","Est. Value"]].head(20))
+        csv = over_df.to_csv(index=False)
+        st.download_button("Download overdue leads (CSV)", data=csv, file_name="overdue_leads.csv", mime="text/csv")
+    else:
+        st.info("No overdue leads detected.")
+
     st.markdown("---")
 
-    # 3) Technician workload (from assignments)
+    # ---------- 2) Pipeline Bottlenecks ----------
+    st.subheader("Pipeline Bottlenecks")
+    try:
+        stages = PIPELINE_STAGES
+    except Exception:
+        stages = df["stage"].unique().tolist()
+
+    # Use value_counts -> reset_index -> unique names (prevents pyarrow error)
+    stage_counts = df["stage"].value_counts().reindex(stages, fill_value=0)
+    stage_df = stage_counts.reset_index()
+    stage_df.columns = ["Stage","Count"]
+    st.table(stage_df.head(20))
+
+    # horizontal bar chart
+    try:
+        fig = px.bar(stage_df, x="Count", y="Stage", orientation="h", height=320, title="Leads by Stage")
+        fig.update_layout(margin=dict(l=10,r=10,t=30,b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        st.write(stage_df)
+
+    st.markdown("---")
+
+    # ---------- 3) Technician Workload (from InspectionAssignment) ----------
     st.subheader("Technician Workload (Assigned Inspections)")
     try:
         s = get_session()
         try:
+            # count assignments per tech
             rows = s.query(InspectionAssignment.technician_username, func.count(InspectionAssignment.id)).group_by(InspectionAssignment.technician_username).all()
             if rows:
-                tw = pd.DataFrame(rows, columns=["Technician", "Assigned Inspections"])
-                tw = tw.sort_values("Assigned Inspections", ascending=False).reset_index(drop=True)
+                tw = pd.DataFrame(rows, columns=["Technician","Assigned Inspections"]).sort_values("Assigned Inspections", ascending=False)
                 st.table(tw)
             else:
-                st.info("No assignments yet.")
+                st.info("No inspection assignments found.")
         finally:
             s.close()
     except Exception as e:
@@ -1215,46 +1210,96 @@ def page_ai_recommendations():
 
     st.markdown("---")
 
-    # 4) Suggestions (simple heuristics)
-    st.subheader("Suggested Actions")
-    suggestions = []
+    # ---------- 4) Internal ML model scoring (optional) ----------
+    st.subheader("Model Scoring & Predictions")
+    model = None
+    model_cols = None
+    try:
+        # try to load internal model if you have one
+        model, model_cols = load_internal_model()
+    except Exception:
+        model = None
+        model_cols = None
 
-    # Scheduled but unassigned
-    scheduled = df[(df["inspection_scheduled"] == True)]
-    scheduled_unassigned = scheduled[(scheduled["assigned_to"].isnull()) | (scheduled["assigned_to"] == "")]
-    for _, r in scheduled_unassigned.iterrows():
-        suggestions.append(f"Lead {r['lead_id']} is scheduled for inspection but has no assigned technician — assign ASAP.")
-
-    # High-value not contacted
-    high_uncontacted = df[(df["estimated_value"] >= 5000) & (df["contacted"] == False)]
-    for _, r in high_uncontacted.iterrows():
-        suggestions.append(f"High-value lead {r['lead_id']} (${int(r['estimated_value']):,}) not contacted — prioritize contact within SLA.")
-
-    # Many leads stuck in same stage
-    bottleneck = stage_df.sort_values("Count", ascending=False).iloc[0] if not stage_df.empty else None
-    if bottleneck is not None and bottleneck["Count"] > max(5, len(df) * 0.2):
-        suggestions.append(f"Stage '{bottleneck['Stage']}' has {int(bottleneck['Count'])} leads — check for process blockers in this stage.")
-
-    # Show suggestions
-    if suggestions:
-        for sgt in suggestions[:15]:
-            st.markdown(f"- {sgt}")
+    if model:
+        st.success("Internal model loaded — scoring leads.")
+        try:
+            df_score_input = df.copy()
+            # Score only required cols if available; score_dataframe should handle missing cols defensively
+            scored = score_dataframe(df_score_input, model, model_cols)
+            # ensure unique column names
+            if "score" in scored.columns:
+                scored = scored.rename(columns={c:c if scored.columns.tolist().count(c)==1 else f"{c}_{i}" for i,c in enumerate(scored.columns)})
+                top_wins = scored.sort_values("score", ascending=False).head(10)
+                top_risk = scored.sort_values("score", ascending=True).head(10)
+                st.markdown("**Top predicted wins**")
+                st.table(top_wins[["lead_id","stage","estimated_value","score"]].head(10))
+                st.markdown("**Top at-risk leads**")
+                st.table(top_risk[["lead_id","stage","estimated_value","score"]].head(10))
+                # export
+                st.download_button("Download scored leads (CSV)", data=scored.to_csv(index=False), file_name="scored_leads.csv", mime="text/csv")
+            else:
+                st.info("Model did not return 'score' column.")
+        except Exception as e:
+            st.error("Model scoring failed: " + str(e))
     else:
-        st.markdown("No immediate suggestions. Pipeline looks healthy.")
+        st.info("No internal model available. You can train one from ML internal page.")
 
     st.markdown("---")
 
-    # 5) Quick export of problematic leads (CSV)
-    st.subheader("Export: Problem Leads")
+    # ---------- 5) Suggestions & Actionable Next Steps (heuristics + model-aware) ----------
+    st.subheader("Suggested Actions (automated heuristics)")
+
+    suggestions = []
+
+    # Suggest: overdue, scheduled but unassigned, high-value uncontacted, stage bottlenecks
+    if not df.empty:
+        # overdue leads
+        for _, r in df.iterrows():
+            rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
+            if overdue_flag and r.get("stage") not in ("Won","Lost"):
+                suggestions.append(f"Lead {r['lead_id']} is OVERDUE in stage {r.get('stage')}. Contact owner or reassign.")
+        # scheduled but unassigned
+        scheduled = df[(df.get("inspection_scheduled") == True)]
+        scheduled_unassigned = scheduled[(scheduled["assigned_to"].isnull()) | (scheduled["assigned_to"] == "")]
+        for _, r in scheduled_unassigned.iterrows():
+            suggestions.append(f"Lead {r['lead_id']} scheduled for inspection but unassigned — assign a technician.")
+        # high-value not contacted
+        high_uncontacted = df[(df["estimated_value"] >= 5000) & (df.get("contacted") != True)]
+        for _, r in high_uncontacted.iterrows():
+            suggestions.append(f"High-value lead {r['lead_id']} (${int(r['estimated_value']):,}) not contacted — prioritize within SLA.")
+        # bottleneck suggestion
+        bottleneck = stage_df.sort_values("Count", ascending=False).iloc[0] if not stage_df.empty else None
+        if bottleneck is not None and bottleneck["Count"] > max(5, len(df) * 0.2):
+            suggestions.append(f"Stage '{bottleneck['Stage']}' is a bottleneck with {int(bottleneck['Count'])} leads — review process at this stage.")
+
+    if suggestions:
+        # dedupe and show top 20
+        seen = set()
+        clean = []
+        for sgt in suggestions:
+            if sgt not in seen:
+                clean.append(sgt); seen.add(sgt)
+        for sgt in clean[:20]:
+            st.markdown("- " + sgt)
+    else:
+        st.markdown("No immediate suggestions — pipeline looks healthy.")
+
+    st.markdown("---")
+
+    # ---------- 6) Quick exports for ops ----------
+    st.subheader("Exports")
     try:
-        problem_df = over_df if (len(over_df) > 0) else pd.DataFrame()
-        if not problem_df.empty:
-            csv = problem_df.to_csv(index=False)
-            st.download_button("Download overdue leads (CSV)", data=csv, file_name="overdue_leads.csv", mime="text/csv")
-        else:
-            st.info("No overdue leads to export.")
+        if 'over_df' in locals() and not over_df.empty:
+            st.download_button("Download overdue leads (CSV)", data=over_df.to_csv(index=False), file_name="overdue_leads.csv", mime="text/csv")
+        # full leads export
+        st.download_button("Download full leads CSV", data=df.to_csv(index=False), file_name="all_leads.csv", mime="text/csv")
     except Exception:
         pass
+
+    st.markdown("---")
+    # End of page
+
 
     # End of page
 
