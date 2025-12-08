@@ -1643,9 +1643,6 @@ else:
     st.info("Page not implemented yet.")
 
 
-else:
-    st.info("Page not implemented yet.")
-
 # Footer
 st.markdown("---")
 st.markdown("<div class='small-muted'>ReCapture Pro. SQLite persistence. Integrated Field Tracking (upgrade) enabled.</div>", unsafe_allow_html=True)
