@@ -851,7 +851,7 @@ def page_dashboard():
 # -----------------------------
 # PIPELINE LEADS LOOP (corrected)
 # -----------------------------
-for idx, lead in df.iterrows():
+for idx, lead in df_view.iterrows():
     with st.container():
         st.markdown(f"### Lead: {lead['lead_id']} — {lead['stage']}")
 
