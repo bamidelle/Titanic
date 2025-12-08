@@ -1334,63 +1334,101 @@ def page_ai_recommendations():
 
     st.markdown("---")
 
-    # ---------- 5) Suggestions & Actionable Next Steps (heuristics + model-aware) ----------
-    st.subheader("Suggested Actions (automated heuristics)")
+suggestions = []
+suggestion_rows = []  # keep structured suggestions: dicts
 
-    suggestions = []
-    suggestion_rows = []  # keep structured suggestions: dicts
-
-    # generate suggestions as before (you already had this)
-    if not df.empty:
-        # overdue leads
-        for _, r in df.iterrows():
-            rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
-            if overdue_flag and r.get("stage") not in ("Won","Lost"):
-                suggestions.append(f"Lead {r['lead_id']} is OVERDUE in stage {r.get('stage')}. Contact owner or reassign.")
-                suggestion_rows.append({"lead_id": r["lead_id"], "text": f"Lead {r['lead_id']} is OVERDUE in stage {r.get('stage')}. Contact owner or reassign.", "priority": "High"})
-        # scheduled but unassigned
-        scheduled = df[(df.get("inspection_scheduled") == True)]
-        scheduled_unassigned = scheduled[(scheduled["assigned_to"].isnull()) | (scheduled["assigned_to"] == "")]
-        for _, r in scheduled_unassigned.iterrows():
-            txt = f"Lead {r['lead_id']} scheduled for inspection but unassigned — assign a technician."
+# -----------------------------
+# Generate suggestions as before
+# -----------------------------
+if not df.empty:
+    # overdue leads
+    for _, r in df.iterrows():
+        rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
+        if overdue_flag and r.get("stage") not in ("Won","Lost"):
+            txt = f"Lead {r['lead_id']} is OVERDUE in stage {r.get('stage')}. Contact owner or reassign."
             suggestions.append(txt)
             suggestion_rows.append({"lead_id": r["lead_id"], "text": txt, "priority": "High"})
-        # high-value not contacted
-        high_uncontacted = df[(df["estimated_value"] >= 5000) & (df.get("contacted") != True)]
-        for _, r in high_uncontacted.iterrows():
-            txt = f"High-value lead {r['lead_id']} (${int(r['estimated_value']):,}) not contacted — prioritize within SLA."
-            suggestions.append(txt)
-            suggestion_rows.append({"lead_id": r["lead_id"], "text": txt, "priority": "High"})
-        # bottleneck suggestion
-        bottleneck = stage_df.sort_values("Count", ascending=False).iloc[0] if not stage_df.empty else None
-        if bottleneck is not None and bottleneck["Count"] > max(5, len(df) * 0.2):
-            txt = f"Stage '{bottleneck['Stage']}' is a bottleneck with {int(bottleneck['Count'])} leads — review process at this stage."
-            suggestions.append(txt)
-            suggestion_rows.append({"lead_id": None, "text": txt, "priority": "Medium"})
 
-        
+    # scheduled but unassigned
+    scheduled = df[(df.get("inspection_scheduled") == True)]
+    scheduled_unassigned = scheduled[(scheduled["assigned_to"].isnull()) | (scheduled["assigned_to"] == "")]
+    for _, r in scheduled_unassigned.iterrows():
+        txt = f"Lead {r['lead_id']} scheduled for inspection but unassigned — assign a technician."
+        suggestions.append(txt)
+        suggestion_rows.append({"lead_id": r["lead_id"], "text": txt, "priority": "High"})
 
-    if not suggestion_rows:
-        st.markdown("No immediate suggestions — pipeline looks healthy.")
-    else:
-        # render each suggestion with a Create Task button and optional assign-to
-        techs_df = get_technicians_df(active_only=True)
-        tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
-        for i, srow in enumerate(suggestion_rows):
-            st.markdown(f"- {srow['text']}")
-            cols = st.columns([2,1,1])
-            with cols[0]:
-                # small input to override priority
-                p = st.selectbox(f"Priority (suggestion {i})", options=["Low","Medium","High","Urgent"], index=["Low","Medium","High","Urgent"].index(srow.get("priority","Medium")), key=f"sugg_priority_{i}")
-            with cols[1]:
-                assignee = st.selectbox(f"Assign to (optional) (suggestion {i})", options=tech_options, index=0, key=f"sugg_assign_{i}")
-            with cols[2]:
-                if st.button("Create Task", key=f"sugg_create_{i}"):
-                    try:
-                        tid = create_task_from_suggestion(suggestion_text=srow["text"], lead_id=srow.get("lead_id"), priority=p, assign_to=assignee, created_by="ai")
-                        st.success(f"Task {tid} created")
-                    except Exception as e:
-                        st.error("Failed to create task: " + str(e))
+    # high-value not contacted
+    high_uncontacted = df[(df["estimated_value"] >= 5000) & (df.get("contacted") != True)]
+    for _, r in high_uncontacted.iterrows():
+        txt = f"High-value lead {r['lead_id']} (${int(r['estimated_value']):,}) not contacted — prioritize within SLA."
+        suggestions.append(txt)
+        suggestion_rows.append({"lead_id": r["lead_id"], "text": txt, "priority": "High"})
+
+    # bottleneck suggestion
+    bottleneck = stage_df.sort_values("Count", ascending=False).iloc[0] if not stage_df.empty else None
+    if bottleneck is not None and bottleneck["Count"] > max(5, len(df) * 0.2):
+        txt = f"Stage '{bottleneck['Stage']}' is a bottleneck with {int(bottleneck['Count'])} leads — review process at this stage."
+        suggestions.append(txt)
+        suggestion_rows.append({"lead_id": None, "text": txt, "priority": "Medium"})
+
+# -----------------------------
+# Optional: Auto-create tasks for top High-priority suggestions
+# -----------------------------
+auto_created = 0
+for s in suggestion_rows:
+    if s.get("priority") == "High" and auto_created < 2:  # change 2 to however many tasks you want auto-created
+        try:
+            create_task_from_suggestion(
+                suggestion_text=s["text"], 
+                lead_id=s.get("lead_id"), 
+                priority="High", 
+                assign_to=None,  # leave unassigned or set a default tech
+                created_by="ai"
+            )
+            auto_created += 1
+        except Exception as e:
+            st.warning(f"Auto-create failed for suggestion: {s['text']}. Error: {e}")
+
+# -----------------------------
+# Render suggestions with manual "Create Task" buttons
+# -----------------------------
+if not suggestion_rows:
+    st.markdown("No immediate suggestions — pipeline looks healthy.")
+else:
+    techs_df = get_technicians_df(active_only=True)
+    tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
+    
+    for i, srow in enumerate(suggestion_rows):
+        st.markdown(f"- {srow['text']}")
+        cols = st.columns([2, 1, 1])
+        with cols[0]:
+            # small input to override priority
+            p = st.selectbox(
+                f"Priority (suggestion {i})", 
+                options=["Low","Medium","High","Urgent"], 
+                index=["Low","Medium","High","Urgent"].index(srow.get("priority","Medium")), 
+                key=f"sugg_priority_{i}"
+            )
+        with cols[1]:
+            assignee = st.selectbox(
+                f"Assign to (optional) (suggestion {i})", 
+                options=tech_options, 
+                index=0, 
+                key=f"sugg_assign_{i}"
+            )
+        with cols[2]:
+            if st.button("Create Task", key=f"sugg_create_{i}"):
+                try:
+                    tid = create_task_from_suggestion(
+                        suggestion_text=srow["text"], 
+                        lead_id=srow.get("lead_id"), 
+                        priority=p, 
+                        assign_to=assignee, 
+                        created_by="ai"
+                    )
+                    st.success(f"Task {tid} created")
+                except Exception as e:
+                    st.error("Failed to create task: " + str(e))
 
 
     # ---------- 6) Quick exports for ops ----------
