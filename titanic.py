@@ -135,6 +135,22 @@ class LocationPing(Base):
     longitude = Column(Float, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
     accuracy = Column(Float, nullable=True)          # optional accuracy (meters)
+
+# ---------- BEGIN BLOCK TASKS: DB MODEL ----------
+class Task(Base):
+    __tablename__ = "tasks"
+    id = Column(Integer, primary_key=True)
+    task_type = Column(String, nullable=False)          # e.g., "Follow-up", "Assign Technician", "SLA Alert"
+    lead_id = Column(String, nullable=True)             # optional link to lead.lead_id
+    description = Column(Text, nullable=False)
+    priority = Column(String, default="Medium")        # Low/Medium/High/Urgent
+    status = Column(String, default="open")            # open, assigned, in_progress, completed, cancelled
+    assigned_to = Column(String, nullable=True)        # username of assignee (technician or user)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+# ---------- END BLOCK TASKS ----------
+
 # ---------- END BLOCK A ----------
 
 
@@ -321,6 +337,75 @@ def persist_location_ping(tech_username: str, latitude: float, longitude: float,
         raise
     finally:
         s.close()
+
+# ---------- BEGIN BLOCK TASK HELPERS ----------
+def create_task(task_type: str, description: str, lead_id: str = None, priority: str = "Medium",
+                assigned_to: str = None, created_by: str = "system"):
+    s = get_session()
+    try:
+        t = Task(task_type=task_type, description=description, lead_id=lead_id,
+                 priority=priority, assigned_to=assigned_to, created_by=created_by)
+        s.add(t)
+        s.commit()
+        return t.id
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+def get_tasks_df(status_filter: list = None):
+    s = get_session()
+    try:
+        q = s.query(Task).order_by(Task.created_at.desc())
+        if status_filter:
+            q = q.filter(Task.status.in_(status_filter))
+        rows = q.all()
+        data = []
+        for r in rows:
+            data.append({
+                "id": r.id,
+                "task_type": r.task_type,
+                "lead_id": r.lead_id,
+                "description": r.description,
+                "priority": r.priority,
+                "status": r.status,
+                "assigned_to": r.assigned_to,
+                "created_by": r.created_by,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at
+            })
+        return pd.DataFrame(data)
+    finally:
+        s.close()
+
+def update_task_status(task_id: int, status: str, assigned_to: str = None):
+    s = get_session()
+    try:
+        t = s.query(Task).filter(Task.id == int(task_id)).first()
+        if not t:
+            return False
+        t.status = status
+        if assigned_to is not None:
+            t.assigned_to = assigned_to
+        s.add(t); s.commit()
+        return True
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+# ---------- END BLOCK TASK HELPERS ----------
+# ---------- BEGIN BLOCK TASK CREATOR ----------
+def create_task_from_suggestion(suggestion_text: str, lead_id: str = None, priority: str = "High", assign_to: str = None, created_by: str = "ai"):
+    # Creates a Task and returns ID
+    try:
+        tid = create_task(task_type="AI Suggestion", description=suggestion_text, lead_id=lead_id, priority=priority, assigned_to=assign_to, created_by=created_by)
+        return tid
+    except Exception as e:
+        raise
+# ---------- END BLOCK TASK CREATOR ----------
+
 # ---------- END BLOCK C ----------
 
 
@@ -580,25 +665,27 @@ body, .stApp { background: #ffffff; color: #0b1220; font-family: 'Comfortaa', sa
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
 # ----------------------
-# Sidebar controls (Admin backend - no front login)
-# ----------------------
 with st.sidebar:
     st.header("TITAN Backend (Admin)")
     st.markdown("You are using the backend admin interface. User accounts and roles are managed in Settings.")
+
     page = st.radio(
-    "Navigate", 
-    [
-        "Dashboard",
-        "Lead Capture",
-        "Pipeline Board",
-        "Analytics",
-        "CPA & ROI",
-        "ML (internal)",
-        "AI Recommendations",   # ← ADD THIS
-        "Settings",
-        "Exports"
-    ], 
-    index=0
+        "Menu",
+        [
+            "Dashboard", 
+            "Lead Capture", 
+            "Pipeline Board", 
+            "Analytics",
+            "CPA & ROI", 
+            "AI Recommendations", 
+            "ML (internal)",
+            "Tasks",
+            "Settings",
+            "Exports"
+        ],
+        index=0
+    )
+
 )
 
     st.markdown("---")
@@ -1251,41 +1338,60 @@ def page_ai_recommendations():
     st.subheader("Suggested Actions (automated heuristics)")
 
     suggestions = []
+    suggestion_rows = []  # keep structured suggestions: dicts
 
-    # Suggest: overdue, scheduled but unassigned, high-value uncontacted, stage bottlenecks
+    # generate suggestions as before (you already had this)
     if not df.empty:
         # overdue leads
         for _, r in df.iterrows():
             rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
             if overdue_flag and r.get("stage") not in ("Won","Lost"):
                 suggestions.append(f"Lead {r['lead_id']} is OVERDUE in stage {r.get('stage')}. Contact owner or reassign.")
+                suggestion_rows.append({"lead_id": r["lead_id"], "text": f"Lead {r['lead_id']} is OVERDUE in stage {r.get('stage')}. Contact owner or reassign.", "priority": "High"})
         # scheduled but unassigned
         scheduled = df[(df.get("inspection_scheduled") == True)]
         scheduled_unassigned = scheduled[(scheduled["assigned_to"].isnull()) | (scheduled["assigned_to"] == "")]
         for _, r in scheduled_unassigned.iterrows():
-            suggestions.append(f"Lead {r['lead_id']} scheduled for inspection but unassigned — assign a technician.")
+            txt = f"Lead {r['lead_id']} scheduled for inspection but unassigned — assign a technician."
+            suggestions.append(txt)
+            suggestion_rows.append({"lead_id": r["lead_id"], "text": txt, "priority": "High"})
         # high-value not contacted
         high_uncontacted = df[(df["estimated_value"] >= 5000) & (df.get("contacted") != True)]
         for _, r in high_uncontacted.iterrows():
-            suggestions.append(f"High-value lead {r['lead_id']} (${int(r['estimated_value']):,}) not contacted — prioritize within SLA.")
+            txt = f"High-value lead {r['lead_id']} (${int(r['estimated_value']):,}) not contacted — prioritize within SLA."
+            suggestions.append(txt)
+            suggestion_rows.append({"lead_id": r["lead_id"], "text": txt, "priority": "High"})
         # bottleneck suggestion
         bottleneck = stage_df.sort_values("Count", ascending=False).iloc[0] if not stage_df.empty else None
         if bottleneck is not None and bottleneck["Count"] > max(5, len(df) * 0.2):
-            suggestions.append(f"Stage '{bottleneck['Stage']}' is a bottleneck with {int(bottleneck['Count'])} leads — review process at this stage.")
+            txt = f"Stage '{bottleneck['Stage']}' is a bottleneck with {int(bottleneck['Count'])} leads — review process at this stage."
+            suggestions.append(txt)
+            suggestion_rows.append({"lead_id": None, "text": txt, "priority": "Medium"})
 
-    if suggestions:
-        # dedupe and show top 20
-        seen = set()
-        clean = []
-        for sgt in suggestions:
-            if sgt not in seen:
-                clean.append(sgt); seen.add(sgt)
-        for sgt in clean[:20]:
-            st.markdown("- " + sgt)
-    else:
+        
+
+    if not suggestion_rows:
         st.markdown("No immediate suggestions — pipeline looks healthy.")
+    else:
+        # render each suggestion with a Create Task button and optional assign-to
+        techs_df = get_technicians_df(active_only=True)
+        tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
+        for i, srow in enumerate(suggestion_rows):
+            st.markdown(f"- {srow['text']}")
+            cols = st.columns([2,1,1])
+            with cols[0]:
+                # small input to override priority
+                p = st.selectbox(f"Priority (suggestion {i})", options=["Low","Medium","High","Urgent"], index=["Low","Medium","High","Urgent"].index(srow.get("priority","Medium")), key=f"sugg_priority_{i}")
+            with cols[1]:
+                assignee = st.selectbox(f"Assign to (optional) (suggestion {i})", options=tech_options, index=0, key=f"sugg_assign_{i}")
+            with cols[2]:
+                if st.button("Create Task", key=f"sugg_create_{i}"):
+                    try:
+                        tid = create_task_from_suggestion(suggestion_text=srow["text"], lead_id=srow.get("lead_id"), priority=p, assign_to=assignee, created_by="ai")
+                        st.success(f"Task {tid} created")
+                    except Exception as e:
+                        st.error("Failed to create task: " + str(e))
 
-    st.markdown("---")
 
     # ---------- 6) Quick exports for ops ----------
     st.subheader("Exports")
@@ -1302,6 +1408,50 @@ def page_ai_recommendations():
 
 
     # End of page
+def page_tasks():
+    st.markdown("<div class='header'>🗂️ Tasks</div>", unsafe_allow_html=True)
+    st.markdown("<em>Operational task queue (auto-created by AI or manual).</em>", unsafe_allow_html=True)
+
+    # Filters
+    f1, f2 = st.columns([2,1])
+    with f1:
+        status_filter = st.selectbox("Status", options=["All","open","assigned","in_progress","completed","cancelled"], index=0)
+    with f2:
+        priority_filter = st.selectbox("Priority", options=["All","Urgent","High","Medium","Low"], index=0)
+
+    statuses = None if status_filter == "All" else [status_filter]
+    tasks_df = get_tasks_df(status_filter=statuses)
+    if tasks_df is None or tasks_df.empty:
+        st.info("No tasks found.")
+        return
+
+    # apply priority filter
+    if priority_filter != "All":
+        tasks_df = tasks_df[tasks_df["priority"] == priority_filter]
+
+    # show table
+    st.dataframe(tasks_df[["id","task_type","lead_id","priority","status","assigned_to","created_at"]].sort_values("created_at", ascending=False))
+
+    # Action: select a task to update
+    st.markdown("### Update task")
+    sel = st.number_input("Task ID", min_value=0, value=0, step=1, key="task_sel_id")
+    if sel:
+        row = tasks_df[tasks_df["id"] == int(sel)]
+        if row.empty:
+            st.warning("Task not found.")
+        else:
+            row = row.iloc[0]
+            st.write("**Description**")
+            st.write(row["description"])
+            new_status = st.selectbox("New status", options=["open","assigned","in_progress","completed","cancelled"], index=["open","assigned","in_progress","completed","cancelled"].index(row["status"]))
+            new_assignee = st.text_input("Assign to (username)", value=row["assigned_to"] or "")
+            if st.button("Save task update", key=f"save_task_{sel}"):
+                try:
+                    update_task_status(task_id=sel, status=new_status, assigned_to=new_assignee or None)
+                    st.success("Task updated")
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error("Failed to update task: " + str(e))
 
 
 # Settings page: user & role management, weights (priority), audit trail
@@ -1483,10 +1633,16 @@ elif page == "AI Recommendations":
     page_ai_recommendations()
 elif page == "ML (internal)":
     page_ml_internal()
+elif page == "Tasks":
+    page_tasks()       # ✅ newly added
 elif page == "Settings":
     page_settings()
 elif page == "Exports":
     page_exports()
+else:
+    st.info("Page not implemented yet.")
+
+
 else:
     st.info("Page not implemented yet.")
 
