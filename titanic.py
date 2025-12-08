@@ -840,15 +840,116 @@ def page_dashboard():
                         st.markdown(f"<div class='small-muted'>⏳ {hours}h {mins}m left</div>", unsafe_allow_html=True)
                 # update form
                 c1, c2 = st.columns(2)
-                with st.form(f"update_{lead['lead_id']}", clear_on_submit=False):
-                    new_stage = st.selectbox("Status", PIPELINE_STAGES, index=PIPELINE_STAGES.index(lead.get("stage")) if lead.get("stage") in PIPELINE_STAGES else 0)
-                    new_assigned = st.text_input("Assigned to (username)", value=lead.get("assigned_to") or "")
-                    new_est = st.number_input("Estimated value (USD)", value=float(lead.get("estimated_value") or 0.0), min_value=0.0, step=100.0)
-                    new_cost = st.number_input("Cost to acquire lead (USD)", value=float(lead.get("ad_cost") or 0.0), min_value=0.0, step=1.0)
-                    new_notes = st.text_area("Notes", value=lead.get("notes") or "")
-                    
+with st.form(f"update_{lead['lead_id']}", clear_on_submit=False):
+
+    new_stage = st.selectbox(
+        "Status",
+        PIPELINE_STAGES,
+        index=PIPELINE_STAGES.index(lead.get("stage")) if lead.get("stage") in PIPELINE_STAGES else 0,
+        key=f"stage_{lead['lead_id']}"
+    )
+
+    new_assigned = st.text_input(
+        "Assigned to (username)",
+        value=lead.get("assigned_to") or "",
+        key=f"assigned_{lead['lead_id']}"
+    )
+
+    new_est = st.number_input(
+        "Estimated value (USD)",
+        value=float(lead.get("estimated_value") or 0.0),
+        min_value=0.0,
+        step=100.0,
+        key=f"estval_{lead['lead_id']}"
+    )
+
+    new_cost = st.number_input(
+        "Cost to acquire lead (USD)",
+        value=float(lead.get("ad_cost") or 0.0),
+        min_value=0.0,
+        step=1.0,
+        key=f"cost_{lead['lead_id']}"
+    )
+
+    new_notes = st.text_area(
+        "Notes",
+        value=lead.get("notes") or "",
+        key=f"notes_{lead['lead_id']}"
+    )
+
+    # 👍 CORRECT — submit button INSIDE the form
+    submitted = st.form_submit_button(
+        "Save changes",
+        key=f"save_changes_{lead['lead_id']}"
+    )
+
+    if submitted:
+        try:
+            upsert_lead_record({
+                "lead_id": lead["lead_id"],
+                "stage": new_stage,
+                "assigned_to": new_assigned or None,
+                "estimated_value": new_est,
+                "ad_cost": new_cost,
+                "notes": new_notes
+            }, actor="admin")
+
+            st.success("Lead updated")
+            st.experimental_rerun()
+
+        except Exception as e:
+            st.error("Failed to update lead: " + str(e))
+            st.write(traceback.format_exc())
 
 
+# ------------------------------------------------------------
+# ---------- BLOCK E: TECHNICIAN ASSIGNMENT (OUTSIDE FORM) ---
+# ------------------------------------------------------------
+
+st.markdown("### Technician Assignment")
+
+techs_df = get_technicians_df(active_only=True)
+tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
+
+selected_tech = st.selectbox(
+    "Assign Technician (active)",
+    options=tech_options,
+    index=0,
+    key=f"tech_select_{lead['lead_id']}"
+)
+
+assign_notes = st.text_area(
+    "Assignment notes (optional)",
+    value="",
+    key=f"tech_notes_{lead['lead_id']}"
+)
+
+if st.button(
+    f"Assign Technician to {lead['lead_id']}",
+    key=f"assign_btn_{lead['lead_id']}"
+):
+    if not selected_tech:
+        st.error("Select a technician")
+    else:
+        try:
+            create_inspection_assignment(
+                lead_id=lead["lead_id"],
+                technician_username=selected_tech,
+                notes=assign_notes
+            )
+
+            st.success(f"Assigned {selected_tech} to lead {lead['lead_id']}")
+
+            upsert_lead_record({
+                "lead_id": lead["lead_id"],
+                "inspection_scheduled": True,
+                "stage": "Inspection Scheduled"
+            }, actor="admin")
+
+            st.experimental_rerun()
+
+        except Exception as e:
+            st.error("Failed to assign: " + str(e))
 
 # ------------------------------------------------------------
 # NEXT PAGE STARTS HERE
