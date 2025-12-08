@@ -1110,64 +1110,130 @@ def page_ml_internal():
 
 # ---------- BEGIN BLOCK G: AI RECOMMENDATIONS PAGE ----------
 def page_ai_recommendations():
+    """AI Recommendations — cleaned, safe, and optimized."""
+    import plotly.express as px
+    from sqlalchemy import func
+
     st.markdown("<div class='header'>🤖 AI Recommendations</div>", unsafe_allow_html=True)
-    st.markdown("<em>Auto-suggested actions based on pipeline state, SLAs, and technician assignments.</em>", unsafe_allow_html=True)
-    df = leads_to_df(start_dt, end_dt)
+    st.markdown("<em>Heuristic recommendations and quick diagnostics for the pipeline.</em>", unsafe_allow_html=True)
+
+    # Load leads defensively
+    try:
+        df = leads_to_df()
+    except Exception as e:
+        st.error(f"Failed to load leads: {e}")
+        df = pd.DataFrame()
+
     if df.empty:
         st.info("No leads to analyze.")
         return
 
-    # Top overdue leads
+    # 1) Top overdue leads
+    st.subheader("Top Overdue Leads")
     overdue_list = []
     for _, r in df.iterrows():
-        rem_s, overdue = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
-        if overdue and r.get("stage") not in ("Won","Lost"):
-            overdue_list.append({"lead_id": r["lead_id"], "stage": r["stage"], "assigned_to": r.get("assigned_to"), "value": r.get("estimated_value")})
-    st.subheader("Top Overdue Leads")
+        rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
+        if overdue_flag and r.get("stage") not in ("Won", "Lost"):
+            overdue_list.append({
+                "lead_id": r["lead_id"],
+                "stage": r.get("stage"),
+                "assigned_to": r.get("assigned_to"),
+                "value": r.get("estimated_value") or 0.0,
+                "overdue_seconds": rem_s
+            })
     if overdue_list:
-        st.table(pd.DataFrame(overdue_list).head(10))
+        over_df = pd.DataFrame(overdue_list).sort_values("value", ascending=False)
+        # keep columns unique and friendly
+        over_df = over_df.rename(columns={"lead_id": "Lead ID", "stage": "Stage", "assigned_to": "Assigned To", "value": "Est. Value", "overdue_seconds": "Overdue Seconds"})
+        st.table(over_df[["Lead ID", "Stage", "Assigned To", "Est. Value"]].head(10))
     else:
         st.info("No overdue leads.")
 
-    # Bottleneck stages
+    st.markdown("---")
+
+    # 2) Pipeline Bottlenecks (stage counts)
     st.subheader("Pipeline Bottlenecks")
-    stage_counts = df["stage"].value_counts().reset_index().rename(columns={"index":"stage","stage":"count"})
-    # Ensure it is a proper DataFrame and columns are unique
-stage_df = stage_counts.reset_index()
-stage_df.columns = [f"col_{i}" for i in range(len(stage_df.columns))]
-
-st.table(stage_df.head(10))
-
-
-    # Technicians workload
-    st.subheader("Technician Workload (Assigned Inspections)")
-    s = get_session()
     try:
-        q = s.query(InspectionAssignment.technician_username, func.count(InspectionAssignment.id).label("assignments")).group_by(InspectionAssignment.technician_username).order_by("assignments desc")
-        # SQLAlchemy func import
-    finally:
-        s.close()
+        stages = PIPELINE_STAGES
+    except Exception:
+        stages = ["New", "Contacted", "Inspection Scheduled", "Inspection", "Estimate Sent", "Won", "Lost"]
 
-    # Simple action suggestions
+    stage_counts = df["stage"].value_counts().reindex(stages, fill_value=0)
+    stage_df = stage_counts.reset_index()
+    stage_df.columns = ["Stage", "Count"]        # ensure unique column names
+    st.table(stage_df.head(10))
+
+    # Small horizontal bar chart (plotly)
+    try:
+        fig = px.bar(stage_df, x="Count", y="Stage", orientation="h", title="Leads by Stage", height=300)
+        fig.update_layout(margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        pass
+
+    st.markdown("---")
+
+    # 3) Technician workload (from assignments)
+    st.subheader("Technician Workload (Assigned Inspections)")
+    try:
+        s = get_session()
+        try:
+            rows = s.query(InspectionAssignment.technician_username, func.count(InspectionAssignment.id)).group_by(InspectionAssignment.technician_username).all()
+            if rows:
+                tw = pd.DataFrame(rows, columns=["Technician", "Assigned Inspections"])
+                tw = tw.sort_values("Assigned Inspections", ascending=False).reset_index(drop=True)
+                st.table(tw)
+            else:
+                st.info("No assignments yet.")
+        finally:
+            s.close()
+    except Exception as e:
+        st.error("Failed to load assignments: " + str(e))
+
+    st.markdown("---")
+
+    # 4) Suggestions (simple heuristics)
     st.subheader("Suggested Actions")
     suggestions = []
-    # Suggest reassign if inspection scheduled but no tech assigned
-    unassigned = df[df["inspection_scheduled"] == True]
-    unassigned = unassigned[unassigned["assigned_to"].isnull() | (unassigned["assigned_to"] == "")]
-    for _, r in unassigned.iterrows():
+
+    # Scheduled but unassigned
+    scheduled = df[(df["inspection_scheduled"] == True)]
+    scheduled_unassigned = scheduled[(scheduled["assigned_to"].isnull()) | (scheduled["assigned_to"] == "")]
+    for _, r in scheduled_unassigned.iterrows():
         suggestions.append(f"Lead {r['lead_id']} is scheduled for inspection but has no assigned technician — assign ASAP.")
-    # Suggest follow-up on high-value leads not contacted
+
+    # High-value not contacted
     high_uncontacted = df[(df["estimated_value"] >= 5000) & (df["contacted"] == False)]
     for _, r in high_uncontacted.iterrows():
-        suggestions.append(f"High-value lead {r['lead_id']} (${r['estimated_value']:,.0f}) not contacted — call within SLA.")
-    # show up to 10 suggestions
+        suggestions.append(f"High-value lead {r['lead_id']} (${int(r['estimated_value']):,}) not contacted — prioritize contact within SLA.")
+
+    # Many leads stuck in same stage
+    bottleneck = stage_df.sort_values("Count", ascending=False).iloc[0] if not stage_df.empty else None
+    if bottleneck is not None and bottleneck["Count"] > max(5, len(df) * 0.2):
+        suggestions.append(f"Stage '{bottleneck['Stage']}' has {int(bottleneck['Count'])} leads — check for process blockers in this stage.")
+
+    # Show suggestions
     if suggestions:
-        for sgt in suggestions[:10]:
+        for sgt in suggestions[:15]:
             st.markdown(f"- {sgt}")
     else:
         st.markdown("No immediate suggestions. Pipeline looks healthy.")
 
-# ---------- END BLOCK G ----------
+    st.markdown("---")
+
+    # 5) Quick export of problematic leads (CSV)
+    st.subheader("Export: Problem Leads")
+    try:
+        problem_df = over_df if (len(over_df) > 0) else pd.DataFrame()
+        if not problem_df.empty:
+            csv = problem_df.to_csv(index=False)
+            st.download_button("Download overdue leads (CSV)", data=csv, file_name="overdue_leads.csv", mime="text/csv")
+        else:
+            st.info("No overdue leads to export.")
+    except Exception:
+        pass
+
+    # End of page
 
 
 # Settings page: user & role management, weights (priority), audit trail
