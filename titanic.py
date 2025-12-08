@@ -1147,17 +1147,18 @@ def page_ai_recommendations():
     st.markdown("---")
 
     # 2) Pipeline Bottlenecks (stage counts)
-st.subheader("Pipeline Bottlenecks")
+    st.subheader("Pipeline Bottlenecks")
 
-# FIX: Convert Series → clean DataFrame with unique columns
-stage_counts = (
-    df["stage"]
-    .value_counts()
-    .reset_index()
-    .rename(columns={"index": "Stage", "stage": "Count"})
-)
+    # FIX: Convert Series → clean DataFrame with unique columns
+    stage_counts = (
+        df["stage"]
+        .value_counts()
+        .reset_index()
+        .rename(columns={"index": "Stage", "stage": "Count"})
+    )
 
-st.table(stage_counts.head(10))
+    st.table(stage_counts.head(10))
+
 
 
     # Small horizontal bar chart (plotly)
