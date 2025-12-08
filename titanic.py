@@ -700,35 +700,128 @@ def alerts_ui():
         st.markdown("")
 
 
-# ----------------------
-# PAGES
-# ----------------------
-
-# Dashboard: KPI cards + Top 5 priority + All leads expanded editor
 def page_dashboard():
-    st.subheader("Dashboard")
+    st.markdown("<div class='header'>📊 Dashboard — ReCapture Pro</div>", unsafe_allow_html=True)
 
-    # Load leads safely
+    # --- Load leads defensively ---
     try:
         df = leads_to_df()
     except Exception as e:
         st.error(f"Failed to load leads: {e}")
         df = pd.DataFrame()
 
-    # Alerts at top
-    alerts_ui()
+    # Alerts (top-right bell) - use alerts_ui helper if available, else inline
+    try:
+        alerts_ui(df)
+    except Exception:
+        # fallback simple alerts inline if alerts_ui not present
+        overdue = []
+        for _, r in df.iterrows():
+            rem_s, overdue_flag = calculate_remaining_sla(r.get("sla_entered_at") or r.get("created_at"), r.get("sla_hours"))
+            if overdue_flag and r.get("stage") not in ("Won", "Lost"):
+                overdue.append(r)
+        if overdue:
+            col1, col2 = st.columns([1, 10])
+            with col1:
+                if st.button(f"🔔 {len(overdue)}", key="alerts_button_dash"):
+                    st.session_state.show_alerts = not st.session_state.get("show_alerts", False)
+            with col2:
+                st.markdown("")
+            if st.session_state.get("show_alerts", False):
+                with st.expander("SLA Alerts (click to close)", expanded=True):
+                    for r in overdue:
+                        st.markdown(
+                            f"**{r['lead_id']}** — Stage: {r['stage']} — "
+                            f"<span style='color:#22c55e;'>${r['estimated_value']:,.0f}</span> — "
+                            f"<span style='color:#dc2626;'>OVERDUE</span>",
+                            unsafe_allow_html=True
+                        )
+                    if st.button("Close Alerts", key="alerts_close_dash"):
+                        st.session_state.show_alerts = False
 
+    st.markdown("---")
+
+    # --- KPI CARDS ---
+    total_leads = len(df) if not df.empty else 0
+    total_pipeline_value = int(df["estimated_value"].sum()) if not df.empty else 0
+    open_leads = 0
+    try:
+        open_leads = int(df[~df["stage"].isin(["Won", "Lost"])].shape[0]) if not df.empty else 0
+    except Exception:
+        open_leads = total_leads
+
+    k1, k2, k3, k4 = st.columns([2,2,2,2])
+    with k1:
+        st.metric("Total Leads", f"{total_leads}")
+    with k2:
+        st.metric("Open Leads", f"{open_leads}")
+    with k3:
+        st.metric("Pipeline Value (USD)", f"${total_pipeline_value:,}")
+    with k4:
+        avg_est = int(df["estimated_value"].mean()) if (not df.empty and df["estimated_value"].notnull().any()) else 0
+        st.metric("Avg. Est. Value", f"${avg_est:,}")
+
+    st.markdown("---")
+
+    # --- Pipeline overview / stage breakdown chart ---
+    st.subheader("Pipeline Overview")
+    if df.empty:
+        st.info("No pipeline data")
+    else:
+        stage_counts = df["stage"].value_counts().reindex(PIPELINE_STAGES, fill_value=0)
+        # Show as bar chart
+        st.bar_chart(stage_counts)
+
+        # small table summary
+        st.table(stage_counts.reset_index().rename(columns={"index":"stage", "stage":"count"}))
+
+    # --- Top 5 Hot Leads ---
+    st.subheader("Top 5 High-Value Leads")
+    if df.empty:
+        st.info("No leads to analyze")
+    else:
+        top5 = df.sort_values("estimated_value", ascending=False).head(5)
+        st.table(top5[["lead_id","contact_name","stage","estimated_value","assigned_to"]].reset_index(drop=True))
+
+    # --- New leads today ---
+    st.subheader("New Leads — Last 24 hours")
+    now = pd.Timestamp.utcnow()
+    if df.empty:
+        st.info("No new leads")
+    else:
+        try:
+            recent = df[pd.to_datetime(df["created_at"]) >= (now - pd.Timedelta(days=1))]
+            if recent.empty:
+                st.write("No new leads in the last 24 hours.")
+            else:
+                st.table(recent[["lead_id","contact_name","created_at","source","estimated_value"]].sort_values("created_at", ascending=False).reset_index(drop=True))
+        except Exception:
+            st.info("No recent leads.")
+
+    st.markdown("---")
+
+    # --- Optional: small pipeline snapshot (top 3 stages) ---
+    st.subheader("Pipeline Snapshot")
+    if df.empty:
+        st.info("No pipeline snapshot available.")
+    else:
+        snap = df["stage"].value_counts().reset_index().rename(columns={"index":"stage","stage":"count"})
+        st.dataframe(snap.head(10))
+
+    st.markdown("---")
+
+    # --- Leads list with expanders + edit form + tech assignment (correct placement & keys) ---
     st.markdown("### 📋 All Leads (expand a card to edit / change status)")
     st.markdown("<em>Expand a lead to edit details, change status, assign owner, and create estimates.</em>", unsafe_allow_html=True)
 
     # Quick filters
     q1, q2, q3 = st.columns([3,2,3])
     with q1:
-        search_q = st.text_input("Search (lead_id, contact name, address, notes)")
+        search_q = st.text_input("Search (lead_id, contact name, address, notes)", key="search_main")
     with q2:
-        filter_src = st.selectbox("Source filter", options=["All"] + sorted(df["source"].dropna().unique().tolist()) if not df.empty else ["All"])
+        filter_src = st.selectbox("Source filter", options=["All"] + sorted(df["source"].dropna().unique().tolist()) if not df.empty else ["All"], key="filter_src_main")
     with q3:
-        filter_stage = st.selectbox("Stage filter", options=["All"] + PIPELINE_STAGES)
+        filter_stage = st.selectbox("Stage filter", options=["All"] + PIPELINE_STAGES, key="filter_stage_main")
 
     df_view = df.copy()
     if search_q:
@@ -745,8 +838,11 @@ def page_dashboard():
 
     # iterate leads (most recent first)
     for _, lead in df_view.sort_values("created_at", ascending=False).head(200).iterrows():
+        # make sure lead fields safe
+        lid = lead.get("lead_id")
+        if not lid:
+            continue
 
-        # build an expander per lead; lead is defined inside this loop
         with st.expander(f"#{lead['lead_id']} — {lead.get('contact_name') or 'No name'} — {lead.get('stage')}", expanded=False):
             left, right = st.columns([3,1])
             with left:
@@ -756,11 +852,10 @@ def page_dashboard():
                 st.write(f"**Notes:** {lead.get('notes') or ''}")
                 st.write(f"**Created:** {lead.get('created_at')}")
             with right:
-                sla_sec, overdue = calculate_remaining_sla(lead.get("sla_entered_at") or lead.get("created_at"), lead.get("sla_hours"))
-                if overdue:
+                sla_sec, overdue_flag = calculate_remaining_sla(lead.get("sla_entered_at") or lead.get("created_at"), lead.get("sla_hours"))
+                if overdue_flag:
                     st.markdown("<div style='color:#dc2626;font-weight:700;'>❗ OVERDUE</div>", unsafe_allow_html=True)
                 else:
-                    # protect if sla_sec is None
                     try:
                         hours = int(sla_sec // 3600) if sla_sec is not None else 0
                         mins = int((sla_sec % 3600) // 60) if sla_sec is not None else 0
@@ -768,7 +863,7 @@ def page_dashboard():
                         hours, mins = 0, 0
                     st.markdown(f"<div class='small-muted'>⏳ {hours}h {mins}m left</div>", unsafe_allow_html=True)
 
-            # ---------- UPDATE FORM (inside expander)
+            # -------------------- UPDATE FORM (inside expander) --------------------
             with st.form(f"update_{lead['lead_id']}", clear_on_submit=False):
                 new_stage = st.selectbox(
                     "Status",
@@ -822,7 +917,7 @@ def page_dashboard():
                         st.error("Failed to update lead: " + str(e))
                         st.write(traceback.format_exc())
 
-            # ---------- TECHNICIAN ASSIGNMENT (still inside expander & loop)
+            # -------------------- TECHNICIAN ASSIGNMENT (outside form but inside expander) --------------------
             st.markdown("### Technician Assignment")
 
             techs_df = get_technicians_df(active_only=True)
@@ -860,6 +955,12 @@ def page_dashboard():
                         st.experimental_rerun()
                     except Exception as e:
                         st.error("Failed to assign: " + str(e))
+
+    # end loop
+    # final small footer summary
+    st.markdown("---")
+    st.markdown("<div class='small-muted'>Dashboard generated by ReCapture Pro</div>", unsafe_allow_html=True)
+
 
 
 
