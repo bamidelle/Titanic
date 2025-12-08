@@ -877,7 +877,7 @@ def page_dashboard():
                         }, actor="admin")
 
                         st.success("Lead updated")
-                        from streamlit.runtime.scriptrunner import request_rerun request_rerun()
+                        st.rerun()
 
                     except Exception as e:
                         st.error("Failed to update lead: " + str(e))
@@ -922,7 +922,7 @@ def page_dashboard():
                         }, actor="admin")
 
                         st.success(f"Assigned {selected_tech} to lead {lead['lead_id']}")
-                        from streamlit.runtime.scriptrunner import request_rerun request_rerun()
+                        st.rerun()
 
                     except Exception as e:
                         st.error("Failed to assign: " + str(e))
@@ -1294,7 +1294,7 @@ def page_settings():
                 try:
                     add_technician(t_uname.strip(), full_name=t_name.strip(), phone=t_phone.strip(), specialization=t_role_sel, active=t_active)
                     st.success("Technician saved")
-                    from streamlit.runtime.scriptrunner import request_rerun request_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error("Failed to save technician: " + str(e))
     if tech_df is not None and not tech_df.empty:
