@@ -1146,10 +1146,22 @@ def page_ai_recommendations():
 
     st.markdown("---")
 
+def page_ai_recommendations():
+    st.header("AI Recommendations")
+
+    # 1) Ensure the DataFrame exists and has the 'stage' column
+    if 'df' not in globals() or df.empty:
+        st.warning("No data available.")
+        return
+
+    if 'stage' not in df.columns:
+        st.warning("The 'stage' column is missing in your dataset.")
+        return
+
     # 2) Pipeline Bottlenecks (stage counts)
     st.subheader("Pipeline Bottlenecks")
 
-    # FIX: Convert Series → clean DataFrame with unique columns
+    # Convert Series → clean DataFrame with unique columns
     stage_counts = (
         df["stage"]
         .value_counts()
@@ -1157,7 +1169,18 @@ def page_ai_recommendations():
         .rename(columns={"index": "Stage", "stage": "Count"})
     )
 
+    # Show top 10 stages
     st.table(stage_counts.head(10))
+
+    # Identify bottleneck stage safely
+    bottleneck = stage_counts.sort_values("Count", ascending=False).iloc[0] if not stage_counts.empty else None
+
+    if bottleneck is not None:
+        st.success(f"Pipeline bottleneck stage: **{bottleneck['Stage']}** ({bottleneck['Count']} leads)")
+    else:
+        st.info("No bottleneck stage found.")
+
+    # Add more AI recommendation logic here if needed
 
 
 
