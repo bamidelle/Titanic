@@ -1132,7 +1132,12 @@ def page_ai_recommendations():
     # Bottleneck stages
     st.subheader("Pipeline Bottlenecks")
     stage_counts = df["stage"].value_counts().reset_index().rename(columns={"index":"stage","stage":"count"})
-    st.table(stage_counts.head(10))
+    # Ensure it is a proper DataFrame and columns are unique
+stage_df = stage_counts.reset_index()
+stage_df.columns = [f"col_{i}" for i in range(len(stage_df.columns))]
+
+st.table(stage_df.head(10))
+
 
     # Technicians workload
     st.subheader("Technician Workload (Assigned Inspections)")
