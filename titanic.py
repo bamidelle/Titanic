@@ -911,7 +911,7 @@ def page_dashboard():
                         st.write(traceback.format_exc())
 
 
-            # ------------------------------------------------------------
+# ------------------------------------------------------------
 # ---------- BLOCK E: TECHNICIAN ASSIGNMENT (OUTSIDE FORM) ---
 # ------------------------------------------------------------
 
@@ -959,29 +959,6 @@ if st.button(
 
         except Exception as e:
             st.error("Failed to assign: " + str(e))
-
-            # Technician assignment (outside form)
-            st.markdown("### Technician Assignment")
-            techs_df = get_technicians_df(active_only=True)
-            tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
-            selected_tech = st.selectbox("Assign Technician (active)", options=tech_options, index=0, key=f"tech_select_{lead['lead_id']}")
-            assign_notes = st.text_area("Assignment notes (optional)", value="", key=f"tech_notes_{lead['lead_id']}")
-            if st.button(f"Assign Technician to {lead['lead_id']}", key=f"assign_btn_{lead['lead_id']}"):
-                if not selected_tech:
-                    st.error("Select a technician")
-                else:
-                    try:
-                        create_inspection_assignment(lead_id=lead["lead_id"], technician_username=selected_tech, notes=assign_notes)
-                        upsert_lead_record({
-                            "lead_id": lead["lead_id"],
-                            "inspection_scheduled": True,
-                            "stage": "Inspection Scheduled"
-                        }, actor="admin")
-                        st.success(f"Assigned {selected_tech} to lead {lead['lead_id']}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error("Failed to assign: " + str(e))
-    # end for
 
 
 
