@@ -1105,23 +1105,25 @@ def page_ml_internal():
 
 # ---------- BEGIN BLOCK G: AI RECOMMENDATIONS PAGE ----------
 def page_ai_recommendations():
+   
     """AI Recommendations — cleaned, safe, and optimized."""
-    import plotly.express as px
-    from sqlalchemy import func
-
+def page_ai_recommendations():
     st.markdown("<div class='header'>🤖 AI Recommendations</div>", unsafe_allow_html=True)
-    st.markdown("<em>Heuristic recommendations and quick diagnostics for the pipeline.</em>", unsafe_allow_html=True)
 
-    # Load leads defensively
-    try:
-        df = leads_to_df()
-    except Exception as e:
-        st.error(f"Failed to load leads: {e}")
-        df = pd.DataFrame()
+    # ALWAYS refresh live data
+    df = leads_to_df()
 
-    if df.empty:
-        st.info("No leads to analyze.")
+    if df is None or df.empty:
+        st.warning("No lead data available. Please add leads first.")
         return
+
+    # Ensure required columns exist
+    required = ["stage", "estimated_value", "created_at"]
+    for col in required:
+        if col not in df.columns:
+            st.error(f"Missing required column: {col}")
+            return
+
 
     # 1) Top overdue leads
     st.subheader("Top Overdue Leads")
