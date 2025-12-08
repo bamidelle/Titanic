@@ -1334,7 +1334,7 @@ def page_ai_recommendations():
 
     st.markdown("---")
 
-   suggestions = []
+    suggestions = []
     suggestion_rows = []  # keep structured suggestions: dicts
 
     # generate suggestions as before (you already had this)
