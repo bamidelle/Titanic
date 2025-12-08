@@ -666,7 +666,7 @@ st.markdown(APP_CSS, unsafe_allow_html=True)
 
 # ----------------------
 with st.sidebar:
-    st.header("TITAN Backend (Admin)")
+    st.header("ReCapture Pro (Admin)")
     st.markdown("You are using the backend admin interface. User accounts and roles are managed in Settings.")
 
     page = st.radio(
