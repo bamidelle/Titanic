@@ -324,6 +324,71 @@ def get_assignments_for_lead(lead_id: str):
         return rows
     finally:
         s.close()
+# ---------- BEGIN BLOCK C.1: TECH / ASSIGNMENT HELPERS ----------
+def get_assignments_for_technician(technician_username: str, only_open: bool = True):
+    """
+    Returns list of assignments with related lead fields for a technician.
+    Each item: { id, lead_id, assigned_at, status, notes, lead: {contact_name, property_address, stage, estimated_value} }
+    """
+    s = get_session()
+    try:
+        q = s.query(InspectionAssignment).filter(InspectionAssignment.technician_username == technician_username)
+        if only_open:
+            q = q.filter(InspectionAssignment.status != "completed")
+        rows = q.order_by(InspectionAssignment.assigned_at.desc()).all()
+        results = []
+        for r in rows:
+            lead = s.query(Lead).filter(Lead.lead_id == r.lead_id).first() if getattr(r, "lead_id", None) else None
+            results.append({
+                "id": r.id,
+                "lead_id": r.lead_id,
+                "assigned_at": r.assigned_at.isoformat() if r.assigned_at else None,
+                "status": r.status,
+                "notes": r.notes,
+                "lead": {
+                    "contact_name": getattr(lead, "contact_name", None) if lead else None,
+                    "property_address": getattr(lead, "property_address", None) if lead else None,
+                    "stage": getattr(lead, "stage", None) if lead else None,
+                    "estimated_value": float(getattr(lead, "estimated_value", 0) or 0) if lead else 0
+                }
+            })
+        return results
+    finally:
+        s.close()
+
+def update_assignment_status(assignment_id: int, status: str = None, note: str = None, mark_lead_inspection_completed: bool = False):
+    """
+    Update assignment status and optional note. Optionally also update the associated lead (inspection_completed).
+    Returns True/False.
+    """
+    s = get_session()
+    try:
+        ia = s.query(InspectionAssignment).filter(InspectionAssignment.id == int(assignment_id)).first()
+        if not ia:
+            return False
+        if status:
+            ia.status = status
+        if note is not None:
+            # append note to existing notes
+            existing = ia.notes or ""
+            ts = datetime.utcnow().isoformat()
+            ia.notes = existing + ("\n" if existing else "") + f"{ts} - {note}"
+        s.add(ia)
+        # update lead if requested
+        if mark_lead_inspection_completed and ia.lead_id:
+            lead = s.query(Lead).filter(Lead.lead_id == ia.lead_id).first()
+            if lead:
+                lead.inspection_completed = True
+                s.add(lead)
+        s.commit()
+        return True
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+# ---------- END BLOCK C.1 ----------
+
 
 def persist_location_ping(tech_username: str, latitude: float, longitude: float, lead_id: str = None, accuracy: float = None, timestamp: datetime = None):
     s = get_session()
@@ -680,6 +745,7 @@ with st.sidebar:
             "AI Recommendations", 
             "ML (internal)",
             "Tasks",
+             "Technician Mobile",
             "Settings",
             "Exports"
         ],
@@ -1451,6 +1517,45 @@ def page_tasks():
                 except Exception as e:
                     st.error("Failed to update task: " + str(e))
 
+def page_technician_mobile():
+    st.markdown("<div class='header'>📱 Technician Mobile Preview</div>", unsafe_allow_html=True)
+    st.markdown("<em>Preview of the mobile shell for technicians (for admins only).</em>", unsafe_allow_html=True)
+
+    uname = st.text_input("Technician username (preview)", value="")
+    if not uname:
+        st.info("Enter a technician username to preview assigned inspections.")
+        return
+
+    try:
+        # call internal helper
+        rows = get_assignments_for_technician(uname, only_open=True)
+    except Exception as e:
+        st.error("Failed to load assignments: " + str(e))
+        return
+
+    if not rows:
+        st.info("No assignments for " + uname)
+        return
+
+    for it in rows:
+        lead = it.get("lead") or {}
+        with st.container():
+            st.markdown(f"**Lead:** {it.get('lead_id') or ''} • {lead.get('contact_name') or ''}")
+            st.markdown(f"{lead.get('property_address') or ''}")
+            st.markdown(f"Stage: **{lead.get('stage') or ''}** • Value: ${int(lead.get('estimated_value') or 0):,}")
+            st.markdown(f"Status: **{it.get('status')}**")
+            new_status = st.selectbox("Set status", ["","enroute","onsite","completed"], key=f"mstat_{it['id']}")
+            note = st.text_area("Note (optional)", key=f"mnote_{it['id']}")
+            if st.button("Save", key=f"msave_{it['id']}"):
+                try:
+                    ok = update_assignment_status(assignment_id=it['id'], status=new_status or None, note=note or None, mark_lead_inspection_completed=(new_status=="completed"))
+                    if ok:
+                        st.success("Updated")
+                        st.experimental_rerun()
+                    else:
+                        st.error("Update failed")
+                except Exception as e:
+                    st.error("Failed to update: " + str(e))
 
 # Settings page: user & role management, weights (priority), audit trail
 def page_settings():
@@ -1597,6 +1702,158 @@ try:
             return jsonify({"ok": True, "ping_id": pid}), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+                # -------------------------------
+    # Technician mobile endpoints
+    # -------------------------------
+    @flask_app.route("/tech/assignments", methods=["GET"])
+    def api_tech_assignments():
+        """
+        Query params:
+        - username: technician username (required)
+        - open_only: "1" or "0" (optional, default 1)
+        """
+        try:
+            username = request.args.get("username")
+            open_only = request.args.get("open_only", "1") != "0"
+            if not username:
+                return jsonify({"error":"username required"}), 400
+            rows = get_assignments_for_technician(username, only_open=open_only)
+            return jsonify({"ok": True, "assignments": rows}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @flask_app.route("/tech/update_assignment", methods=["POST"])
+    def api_update_assignment():
+        """
+        POST JSON:
+        {
+          "assignment_id": 123,
+          "status": "enroute" | "onsite" | "completed",
+          "note": "optional",
+          "mark_lead_completed": true|false
+        }
+        """
+        try:
+            payload = request.get_json(force=True)
+            aid = payload.get("assignment_id")
+            if not aid:
+                return jsonify({"error":"assignment_id required"}), 400
+            status = payload.get("status")
+            note = payload.get("note")
+            mark_lead = bool(payload.get("mark_lead_completed", False))
+            ok = update_assignment_status(assignment_id=aid, status=status, note=note, mark_lead_inspection_completed=mark_lead)
+            return jsonify({"ok": bool(ok)}), 200 if ok else 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # Minimal mobile HTML shell (calls /tech/assignments and /tech/update_assignment)
+    
+    @flask_app.route("/tech/mobile", methods=["GET"])
+    def tech_mobile_shell():
+        html = """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tech Mobile - ReCapture Pro</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;padding:12px;background:#f7f7f9;}
+    .card{background:#fff;padding:12px;margin-bottom:12px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06)}
+    .btn{display:inline-block;padding:8px 10px;border-radius:6px;border:none;margin:4px 2px;font-size:14px}
+    .btn-primary{background:#0ea5e9;color:#fff}
+    .btn-ghost{background:#eef2ff;color:#111}
+    input,select,textarea{width:100%;padding:8px;margin:6px 0;border-radius:6px;border:1px solid #ddd}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  </style>
+</head>
+<body>
+<header>
+  <h3>ReCapture Pro — Tech</h3>
+  <div>
+    <input id="username" placeholder="Technician username" />
+    <button onclick="loadAssignments()" class="btn btn-primary">Load</button>
+  </div>
+</header>
+<div id="assignments"></div>
+
+<script>
+async function loadAssignments(){
+  const u = document.getElementById('username').value;
+  if(!u){ alert('enter username'); return; }
+  document.getElementById('assignments').innerHTML = '<div class="card">Loading...</div>';
+  try{
+    const res = await fetch('/tech/assignments?username=' + encodeURIComponent(u));
+    const j = await res.json();
+    if(!j.ok){ document.getElementById('assignments').innerHTML = '<div class="card">Error loading</div>'; return; }
+    renderAssignments(j.assignments, u);
+  }catch(e){
+    document.getElementById('assignments').innerHTML = '<div class="card">Network error</div>';
+  }
+}
+
+function renderAssignments(items, username){
+  if(!items || items.length===0){
+    document.getElementById('assignments').innerHTML = '<div class="card">No assignments</div>';
+    return;
+  }
+  const container = document.getElementById('assignments');
+  container.innerHTML = '';
+  items.forEach(it => {
+    const lead = it.lead || {};
+    const html = document.createElement('div');
+    html.className = 'card';
+    html.innerHTML = `
+      <div><strong>Lead: ${it.lead_id || '—'}</strong> • <small>${lead.contact_name || ''}</small></div>
+      <div style="margin-top:6px">${lead.property_address || ''}</div>
+      <div style="margin-top:6px">Stage: <strong>${lead.stage || ''}</strong> — Value: $${(lead.estimated_value||0).toLocaleString()}</div>
+      <div style="margin-top:8px">Status: <em id="status_${it.id}">${it.status}</em></div>
+      <div style="margin-top:8px">
+        <select id="select_${it.id}">
+          <option value="">-- set status --</option>
+          <option value="enroute">Enroute</option>
+          <option value="onsite">Onsite</option>
+          <option value="completed">Completed</option>
+        </select>
+      </div>
+      <div style="margin-top:8px">
+        <textarea id="note_${it.id}" placeholder="Add a note (optional)"></textarea>
+      </div>
+      <div style="margin-top:8px">
+        <button class="btn btn-primary" onclick="updateAssignment(${it.id}, '${username}')">Save</button>
+      </div>
+    `;
+    container.appendChild(html);
+  });
+}
+
+async function updateAssignment(aid, username){
+  const sel = document.getElementById('select_' + aid);
+  const note = document.getElementById('note_' + aid).value;
+  const status = sel ? sel.value : '';
+  if(!status){ alert('select a status'); return; }
+  try{
+    const res = await fetch('/tech/update_assignment', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ assignment_id: aid, status: status, note: note, mark_lead_completed: status === 'completed' })
+    });
+    const j = await res.json();
+    if(j.ok){
+      document.getElementById('status_' + aid).innerText = status;
+      alert('Updated');
+    } else {
+      alert('Failed: ' + (j.error || 'unknown'));
+    }
+  }catch(e){
+    alert('Network error');
+  }
+}
+</script>
+</body>
+</html>
+"""
+        return html, 200, {"Content-Type": "text/html"}
+
 
     def run_flask():
         try:
@@ -1633,6 +1890,8 @@ elif page == "ML (internal)":
     page_ml_internal()
 elif page == "Tasks":
     page_tasks()       # ✅ newly added
+elif page == "Technician Mobile":
+    page_technician_mobile()
 elif page == "Settings":
     page_settings()
 elif page == "Exports":
