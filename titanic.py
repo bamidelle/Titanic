@@ -1440,78 +1440,95 @@ def page_dashboard():
                   </div>
                 </div>
             """, unsafe_allow_html=True)
+st.markdown("---")
+st.markdown("---")
+st.markdown("### 📋 All Leads (expand a card to edit / change status)")  
+st.markdown("---")
 
-    st.markdown("---")
-    st.markdown("---")
-    st.markdown("### 📋 All Leads (expand a card to edit / change status)")  
-    st.markdown("---")
-    st.markdown("### Live Technician Map")
-    st.markdown("<em>Latest location for each technician (click Auto-refresh to update automatically).</em>", unsafe_allow_html=True)
-    # small inline control
-    c1, c2 = st.columns([3,1])
-    with c1:
-        inline_show_lines = st.checkbox("Show lines to assigned lead", key="dash_map_lines", value=False)
-    with c2:
-        inline_refresh = st.checkbox("Auto-refresh inline map (meta refresh)", key="dash_map_auto", value=False)
-    if inline_refresh:
-        # default 20 sec
-        st.markdown('<meta http-equiv="refresh" content="20">', unsafe_allow_html=True)
-        
-    # -- put the technician filter code above as previously described --
-    # controls on page_technician_map
-filter_choice = st.selectbox("Filter technician", options=["All"] + get_technicians_df(active_only=True)["username"].tolist(), index=0)
+st.markdown("### Live Technician Map")
+st.markdown("<em>Latest location for each technician (click Auto-refresh to update automatically).</em>", unsafe_allow_html=True)
+
+# small inline control
+c1, c2 = st.columns([3,1])
+with c1:
+    inline_show_lines = st.checkbox("Show lines to assigned lead", key="dash_map_lines", value=False)
+with c2:
+    inline_refresh = st.checkbox("Auto-refresh inline map (meta refresh)", key="dash_map_auto", value=False)
+
+if inline_refresh:
+    # default 20 sec
+    st.markdown('<meta http-equiv="refresh" content="20">', unsafe_allow_html=True)
+
+# ---------------------------
+# Technician Filters
+# ---------------------------
+filter_choice = st.selectbox(
+    "Filter technician",
+    options=["All"] + get_technicians_df(active_only=True)["username"].tolist(),
+    index=0
+)
+
 show_paths = st.checkbox("Show path history", value=False)
 show_heatmap = st.checkbox("Show heatmap (last 24h)", value=False)
 show_assigned = st.checkbox("Show assigned lead markers", value=False)
 
-    render_tech_map(
-        zoom=st.slider("Zoom", 3, 18, 11),
-        show_lines=st.checkbox("Show lines to assigned lead", value=False),
-        filter_tech=None if filter_choice == "All" else filter_choice,
-        show_paths=show_paths,
-        show_heatmap=show_heatmap,
-        show_assigned_leads=show_assigned
+render_tech_map(
+    zoom=st.slider("Zoom", 3, 18, 11),
+    show_lines=st.checkbox("Show lines to assigned lead", value=False),
+    filter_tech=None if filter_choice == "All" else filter_choice,
+    show_paths=show_paths,
+    show_heatmap=show_heatmap,
+    show_assigned_leads=show_assigned
+)
+
+# ---------------------------
+# Leads List Section
+# ---------------------------
+st.markdown("### 📋 All Leads (expand a card to edit / change status)")
+
+# Filter bar
+q1, q2, q3 = st.columns([3,2,3])
+with q1:
+    search_q = st.text_input("Search (lead_id, contact name, address, notes)")
+with q2:
+    filter_src = st.selectbox(
+        "Source filter",
+        options=["All"] + sorted(df["source"].dropna().unique().tolist()) if not df.empty else ["All"]
     )
+with q3:
+    filter_stage = st.selectbox("Stage filter", options=["All"] + PIPELINE_STAGES)
 
+df_view = df.copy()
 
+# --- Search filter ---
+if search_q:
+    sq = search_q.lower()
+    df_view = df_view[df_view.apply(
+        lambda r: (
+            sq in str(r.get("lead_id", "")).lower() or
+            sq in str(r.get("contact_name", "")).lower() or
+            sq in str(r.get("property_address", "")).lower() or
+            sq in str(r.get("notes", "")).lower()
+        ),
+        axis=1
+    )]
 
-    st.markdown("### 📋 All Leads (expand a card to edit / change status)")
+# --- Source filter ---
+if filter_src != "All":
+    df_view = df_view[df_view["source"] == filter_src]
 
-    # Filter bar
-    q1, q2, q3 = st.columns([3,2,3])
-    with q1:
-        search_q = st.text_input("Search (lead_id, contact name, address, notes)")
-    with q2:
-        filter_src = st.selectbox("Source filter", options=["All"] + sorted(df["source"].dropna().unique().tolist()) if not df.empty else ["All"])
-    with q3:
-        filter_stage = st.selectbox("Stage filter", options=["All"] + PIPELINE_STAGES)
+# --- Stage filter ---
+if filter_stage != "All":
+    df_view = df_view[df_view["stage"] == filter_stage]
 
-    df_view = df.copy()
+# --- No leads case ---
+if df_view.empty:
+    st.info("No leads to show.")
+    st.stop()
 
-    if search_q:
-        sq = search_q.lower()
-        df_view = df_view[df_view.apply(
-            lambda r: sq in str(r.get("lead_id","")).lower()
-            or sq in str(r.get("contact_name","")).lower()
-            or sq in str(r.get("property_address","")).lower()
-            or sq in str(r.get("notes","")).lower(),
-            axis=1
-        )]
-
-    if filter_src != "All":
-        df_view = df_view[df_view["source"] == filter_src]
-
-    if filter_stage != "All":
-        df_view = df_view[df_view["stage"] == filter_stage]
-
-    # No leads case
-    if df_view.empty:
-        st.info("No leads to show.")
-        return
-
-    # -----------------------------  
-    # LEADS LIST  
-    # -----------------------------
+# -----------------------------
+# Leads List
+# -----------------------------
     for _, lead in df_view.sort_values("created_at", ascending=False).head(200).iterrows():
 
         with st.expander(f"#{lead['lead_id']} — {lead.get('contact_name') or 'No name'} — {lead.get('stage')}", expanded=False):
