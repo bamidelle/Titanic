@@ -1565,7 +1565,6 @@ def page_technician_mobile():
         return
 
     try:
-        # call internal helper
         rows = get_assignments_for_technician(uname, only_open=True)
     except Exception as e:
         st.error("Failed to load assignments: " + str(e))
@@ -1577,16 +1576,29 @@ def page_technician_mobile():
 
     for it in rows:
         lead = it.get("lead") or {}
+
         with st.container():
             st.markdown(f"**Lead:** {it.get('lead_id') or ''} • {lead.get('contact_name') or ''}")
             st.markdown(f"{lead.get('property_address') or ''}")
             st.markdown(f"Stage: **{lead.get('stage') or ''}** • Value: ${int(lead.get('estimated_value') or 0):,}")
             st.markdown(f"Status: **{it.get('status')}**")
-            new_status = st.selectbox("Set status", ["","enroute","onsite","completed"], key=f"mstat_{it['id']}")
+
+            new_status = st.selectbox(
+                "Set status",
+                ["","enroute","onsite","completed"],
+                key=f"mstat_{it['id']}"
+            )
+
             note = st.text_area("Note (optional)", key=f"mnote_{it['id']}")
+
             if st.button("Save", key=f"msave_{it['id']}"):
                 try:
-                    ok = update_assignment_status(assignment_id=it['id'], status=new_status or None, note=note or None, mark_lead_inspection_completed=(new_status=="completed"))
+                    ok = update_assignment_status(
+                        assignment_id=it['id'],
+                        status=new_status or None,
+                        note=note or None,
+                        mark_lead_inspection_completed=(new_status == "completed")
+                    )
                     if ok:
                         st.success("Updated")
                         st.rerun()
@@ -1594,6 +1606,25 @@ def page_technician_mobile():
                         st.error("Update failed")
                 except Exception as e:
                     st.error("Failed to update: " + str(e))
+
+        # ---- GPS BUTTON (correct indentation) ----
+        if st.button("Send GPS Ping", key=f"gps_{it['id']}"):
+            st.markdown(f"""
+            <script>
+            navigator.geolocation.getCurrentPosition(function(pos) {{
+                const lat = pos.coords.latitude;
+                const lon = pos.coords.longitude;
+                const url = window.location.origin +
+                    "?api=ping_location&tech={uname}&lat=" + lat + "&lon=" + lon;
+
+                fetch(url).then(r => r.json()).then(data => {{
+                    alert("GPS Updated: " + JSON.stringify(data));
+                }});
+            }});
+            </script>
+            """, unsafe_allow_html=True)
+
+
 
 # Settings page: user & role management, weights (priority), audit trail
 def page_settings():
