@@ -2151,6 +2151,8 @@ elif page == "Tasks":
     page_tasks()       # ✅ newly added
 elif page == "Technician Mobile":
     page_technician_mobile()
+elif page == "Technician Map Tracking":
+    page_technician_map()
 elif page == "Settings":
     page_settings()
 elif page == "Exports":
