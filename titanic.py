@@ -25,6 +25,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
+
 # ----------------------
 # CONFIG
 # ----------------------
@@ -546,6 +547,42 @@ def upsert_lead_record(payload: dict, actor="admin"):
         raise
     finally:
         s.close()
+# ----------------------------------------
+# STEP 4: STREAMLIT API ENDPOINT FOR GPS
+# ----------------------------------------
+
+def streamlit_api_handler():
+    params = st.query_params
+
+    if "api" not in params:
+        return  # not an API request
+
+    if params["api"] == "ping_location":
+        try:
+            tech = params.get("tech")
+            lat = params.get("lat")
+            lon = params.get("lon")
+            lead_id = params.get("lead_id", None)
+            acc = params.get("acc", None)
+
+            if not tech or not lat or not lon:
+                st.json({"error": "Missing fields"})
+                st.stop()
+
+            pid = persist_location_ping(
+                tech_username=str(tech),
+                latitude=float(lat),
+                longitude=float(lon),
+                lead_id=lead_id,
+                accuracy=float(acc) if acc else None
+            )
+
+            st.json({"ok": True, "ping_id": pid})
+            st.stop()
+
+        except Exception as e:
+            st.json({"error": str(e)})
+            st.stop()
 
 def delete_lead_record(lead_id: str, actor="admin"):
     s = get_session()
