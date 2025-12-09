@@ -766,6 +766,7 @@ body, .stApp { background: #ffffff; color: #0b1220; font-family: 'Comfortaa', sa
 """
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
+streamlit_api_handler()
 # ----------------------
 with st.sidebar:
     st.header("ReCapture Pro (Admin)")
