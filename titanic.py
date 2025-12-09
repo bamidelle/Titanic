@@ -930,17 +930,18 @@ with st.sidebar:
     page = st.radio(
         "Menu",
         [
-            "Dashboard", 
-            "Lead Capture", 
-            "Pipeline Board", 
-            "Analytics",
-            "CPA & ROI", 
-            "AI Recommendations", 
-            "ML (internal)",
-            "Tasks",
-             "Technician Mobile",
-            "Settings",
-            "Exports"
+        "Dashboard",
+        "Lead Capture",
+        "Pipeline Board",
+        "Analytics",
+        "CPA & ROI",
+        "AI Recommendations",
+        "ML (internal)",
+        "Technician Mobile",
+        "Technician Map Tracking",   # << add this
+        "Tasks",
+        "Settings",
+        "Exports"
         ],
         index=0
     )
@@ -1139,6 +1140,22 @@ def page_dashboard():
             """, unsafe_allow_html=True)
 
     st.markdown("---")
+    st.markdown("---")
+    st.markdown("### 📋 All Leads (expand a card to edit / change status)")  
+    st.markdown("---")
+    st.markdown("### Live Technician Map")
+    st.markdown("<em>Latest location for each technician (click Auto-refresh to update automatically).</em>", unsafe_allow_html=True)
+    # small inline control
+    c1, c2 = st.columns([3,1])
+    with c1:
+        inline_show_lines = st.checkbox("Show lines to assigned lead", key="dash_map_lines", value=False)
+    with c2:
+        inline_refresh = st.checkbox("Auto-refresh inline map (meta refresh)", key="dash_map_auto", value=False)
+    if inline_refresh:
+        # default 20 sec
+        st.markdown('<meta http-equiv="refresh" content="20">', unsafe_allow_html=True)
+    render_tech_map(show_lines=inline_show_lines, height=420, zoom=11)
+
     st.markdown("### 📋 All Leads (expand a card to edit / change status)")
 
     # Filter bar
