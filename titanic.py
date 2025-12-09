@@ -325,72 +325,117 @@ def get_assignments_for_lead(lead_id: str):
         return rows
     finally:
         s.close()
-# ---------- BEGIN BLOCK MAP RENDER ----------
-import pydeck as pdk
 
-def render_tech_map(center=None, zoom=11, height=500, auto_expand=True, show_lines=False):
+
+# ======================================================================
+# 🔵 TECHNICIAN LOCATION & MAP SYSTEM (COMPLETE + CORRECT)
+# ======================================================================
+
+import pydeck as pdk
+from datetime import datetime
+
+# ======================================================================
+# 1) GET LATEST LOCATION PING PER TECHNICIAN
+# ======================================================================
+def get_latest_tech_locations():
     """
-    Renders a pydeck map of latest tech locations.
-    - center: (lat, lon) tuple or None (auto center on techs)
-    - show_lines: if True draw a line from tech to assigned lead latest ping (if available)
+    Returns: list of {tech_username, latitude, longitude, timestamp, accuracy, lead_id}
     """
+    s = get_session()
+    try:
+        rows = (
+            s.query(LocationPing)
+            .order_by(LocationPing.tech_username, LocationPing.timestamp.desc())
+            .all()
+        )
+
+        latest = {}
+
+        for r in rows:
+            uname = getattr(r, "tech_username", None)
+            if not uname:
+                continue
+
+            # first seen per tech = latest ping because of ordering
+            if uname not in latest:
+                latest[uname] = {
+                    "tech_username": uname,
+                    "latitude": float(r.latitude),
+                    "longitude": float(r.longitude),
+                    "timestamp": r.timestamp,
+                    "accuracy": float(r.accuracy) if r.accuracy else None,
+                    "lead_id": getattr(r, "lead_id", None),
+                }
+
+        return list(latest.values())
+
+    finally:
+        s.close()
+
+
+# ======================================================================
+# 2) RENDER INTERACTIVE MAP (TECH LOCATIONS + ARC LINES)
+# ======================================================================
+def render_tech_map(zoom=11, show_lines=False):
     tech_locs = get_latest_tech_locations()
+
     if not tech_locs:
-        st.info("No technician location pings available.")
+        st.info("No technician location data yet.")
         return
 
-    # DataFrame for pydeck
     df = pd.DataFrame(tech_locs)
-    df["lat"] = df["latitude"]
-    df["lon"] = df["longitude"]
-    df["label"] = df.apply(lambda r: f"{r['tech_username']} — {r['timestamp']}", axis=1)
 
-    # center automatically
-    if center is None:
-        center = [float(df["lat"].mean()), float(df["lon"].mean())]
+    # Compute center (average lat/lon)
+    center = (df["latitude"].mean(), df["longitude"].mean())
 
-    # Scatter layer for techs
+    # Base layer: technician markers
     scatter = pdk.Layer(
         "ScatterplotLayer",
         df,
+        get_position=["longitude", "latitude"],
+        get_radius=80,
+        get_color=[255, 0, 0],
         pickable=True,
-        get_position=["lon", "lat"],
-        get_fill_color="[200, 30, 0, 160]",
-        get_radius=50,              # radius in meters (visual)
-        radius_scale=15,
-        radius_min_pixels=6,
-        radius_max_pixels=60,
-        auto_highlight=True,
     )
 
-    # Tooltip (shows username, timestamp, accuracy, linked lead)
     tooltip = {
-        "html": "<b>Technician:</b> {tech_username} <br/> <b>Time:</b> {timestamp} <br/> <b>Lead:</b> {lead_id} <br/> <b>Accuracy:</b> {accuracy}",
-        "style": {"color": "white"}
+        "html": (
+            "<b>Technician:</b> {tech_username}<br/>"
+            "<b>Time:</b> {timestamp}<br/>"
+            "<b>Lead:</b> {lead_id}<br/>"
+            "<b>Accuracy:</b> {accuracy}"
+        ),
+        "style": {"color": "white"},
     }
 
     layers = [scatter]
 
-    # Optional: draw lines from tech to assigned lead's last known ping (if any)
+    # OPTIONAL LINES (tech → lead)
     if show_lines:
-        # build arc data: if lead_id exists and has pings, draw a line from tech to lead's latest ping
         s = get_session()
         try:
             arcs = []
             for r in tech_locs:
                 lid = r.get("lead_id")
-                if lid:
-                    # find latest ping for lead
-                    lead_ping = s.query(LocationPing).filter(LocationPing.lead_id == lid).order_by(LocationPing.timestamp.desc()).first()
-                    if lead_ping:
-                        arcs.append({
-                            "source_lon": float(r["longitude"]),
-                            "source_lat": float(r["latitude"]),
-                            "target_lon": float(lead_ping.longitude),
-                            "target_lat": float(lead_ping.latitude),
-                            "tech": r["tech_username"],
-                            "lead_id": lid
-                        })
+                if not lid:
+                    continue
+
+                # latest ping for that lead
+                latest_lead_ping = (
+                    s.query(LocationPing)
+                    .filter(LocationPing.lead_id == lid)
+                    .order_by(LocationPing.timestamp.desc())
+                    .first()
+                )
+
+                if latest_lead_ping:
+                    arcs.append({
+                        "source_lon": float(r["longitude"]),
+                        "source_lat": float(r["latitude"]),
+                        "target_lon": float(latest_lead_ping.longitude),
+                        "target_lat": float(latest_lead_ping.latitude),
+                    })
+
             if arcs:
                 arc_df = pd.DataFrame(arcs)
                 arc_layer = pdk.Layer(
@@ -405,58 +450,53 @@ def render_tech_map(center=None, zoom=11, height=500, auto_expand=True, show_lin
                     get_target_color=[200, 0, 80],
                 )
                 layers.append(arc_layer)
+
         finally:
             s.close()
 
+    # VIEW STATE
     view_state = pdk.ViewState(
         latitude=float(center[0]),
         longitude=float(center[1]),
         zoom=zoom,
-        pitch=0
+        pitch=0,
     )
 
     deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/light-v9",
-        initial_view_state=view_state,
         layers=layers,
-        tooltip=tooltip
+        tooltip=tooltip,
+        initial_view_state=view_state,
+        map_style="mapbox://styles/mapbox/light-v9",
     )
 
-    # display map
     st.pydeck_chart(deck, use_container_width=True)
-# ---------- END BLOCK MAP RENDER ----------
 
 
-# ---------- BEGIN BLOCK MAP HELPERS ----------
-def get_latest_tech_locations():
-    """
-    Returns list of latest location pings for each active technician:
-    [
-        {"tech_username": str, "latitude": float, "longitude": float, "timestamp": datetime, "accuracy": float, "lead_id": str or None}
-    ]
-    """
-    s = get_session()
-    try:
-        rows = s.query(LocationPing).order_by(LocationPing.tech_username, LocationPing.timestamp.desc()).all()
-        latest = {}
-        for r in rows:
-            key = getattr(r, "tech_username", None)
-            if not key:
-                continue
-            # first occurrence is latest due to ordering
-            if key not in latest:
-                latest[key] = {
-                    "tech_username": key,
-                    "latitude": float(r.latitude),
-                    "longitude": float(r.longitude),
-                    "timestamp": r.timestamp,
-                    "accuracy": float(r.accuracy) if r.accuracy is not None else None,
-                    "lead_id": getattr(r, "lead_id", None)
-                }
-        # convert to list
-        return list(latest.values())
-    finally:
-        s.close()
+# ======================================================================
+# 3) TECHNICIAN MAP PAGE (UI PAGE)
+# ======================================================================
+def page_technician_map():
+    st.markdown("<div class='header'>🗺️ Technician Map Tracking</div>", unsafe_allow_html=True)
+    st.markdown("<em>Live technician GPS locations.</em>", unsafe_allow_html=True)
+
+    # auto refresh option
+    auto = st.checkbox("Enable auto-refresh", value=False)
+    if auto:
+        interval = st.number_input("Refresh interval (sec)", min_value=5, max_value=300, value=20)
+        st.markdown(
+            f'<meta http-equiv="refresh" content="{interval}">', 
+            unsafe_allow_html=True
+        )
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        show_lines = st.checkbox("Show tech → lead lines", value=False)
+    with col2:
+        zoom = st.slider("Zoom", min_value=3, max_value=18, value=11)
+
+    # Render map
+    render_tech_map(zoom=zoom, show_lines=show_lines)
+
 # ---------- END BLOCK MAP HELPERS ----------
 
 # ---------- BEGIN BLOCK C.1: TECH / ASSIGNMENT HELPERS ----------
@@ -523,28 +563,6 @@ def update_assignment_status(assignment_id: int, status: str = None, note: str =
     finally:
         s.close()
 # ---------- END BLOCK C.1 ----------
-
-def page_technician_map():
-    st.markdown("<div class='header'>🗺️ Technician Map Tracking</div>", unsafe_allow_html=True)
-    st.markdown("<em>Live technician locations — latest ping per tech. Use Auto-refresh to update every N seconds.</em>", unsafe_allow_html=True)
-
-    # Auto-refresh controls (meta refresh)
-    auto = st.checkbox("Enable auto-refresh (meta refresh)", value=False)
-    if auto:
-        secs = st.number_input("Refresh interval (seconds)", min_value=5, max_value=300, value=20, step=5)
-        # add a meta refresh tag (simple, reliable)
-        st.markdown(f'<meta http-equiv="refresh" content="{secs}">', unsafe_allow_html=True)
-
-    # Options
-    c1, c2 = st.columns([2,1])
-    with c1:
-        show_lines = st.checkbox("Show lines to assigned lead (if available)", value=False)
-    with c2:
-        zoom = st.slider("Zoom", min_value=3, max_value=18, value=11)
-
-    # Render map
-    render_tech_map(zoom=zoom, show_lines=show_lines)
-
 
 def persist_location_ping(tech_username: str, latitude: float, longitude: float, lead_id: str = None, accuracy: float = None, timestamp: datetime = None):
     s = get_session()
