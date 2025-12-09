@@ -495,9 +495,293 @@ def page_technician_map():
         zoom = st.slider("Zoom", min_value=3, max_value=18, value=11)
 
     # Render map
-    render_tech_map(zoom=zoom, show_lines=show_lines)
+   # controls on page_technician_map
+filter_choice = st.selectbox("Filter technician", options=["All"] + get_technicians_df(active_only=True)["username"].tolist(), index=0)
+show_paths = st.checkbox("Show path history", value=False)
+show_heatmap = st.checkbox("Show heatmap (last 24h)", value=False)
+show_assigned = st.checkbox("Show assigned lead markers", value=False)
+
+render_tech_map(
+    zoom=st.slider("Zoom", 3, 18, 11),
+    show_lines=st.checkbox("Show lines to assigned lead", value=False),
+    filter_tech=None if filter_choice == "All" else filter_choice,
+    show_paths=show_paths,
+    show_heatmap=show_heatmap,
+    show_assigned_leads=show_assigned
+)
+
 
 # ---------- END BLOCK MAP HELPERS ----------
+# =========================
+# TECH MAP: advanced features
+# =========================
+import pydeck as pdk
+from datetime import timedelta
+
+# --- Helper: tech status map (derive a status per tech) ---
+def get_tech_status_map():
+    """
+    Returns dict: { username: status }
+    Status logic (first applicable):
+      - 'onsite' if any assignment for tech has status 'onsite'
+      - 'enroute' if any assignment has 'enroute'
+      - 'assigned' if any assignment is 'assigned'
+      - 'idle' otherwise
+    """
+    s = get_session()
+    try:
+        # load active technicians
+        techs = s.query(Technician).all()
+        status_map = {t.username: "idle" for t in techs if getattr(t, "username", None)}
+        # check assignments
+        rows = s.query(InspectionAssignment).filter(InspectionAssignment.technician_username != None).all()
+        for r in rows:
+            uname = r.technician_username
+            stt = (r.status or "").lower()
+            if not uname:
+                continue
+            # priority: onsite > enroute > assigned > any other
+            prev = status_map.get(uname, "idle")
+            if "onsite" in stt:
+                status_map[uname] = "onsite"
+            elif prev != "onsite" and "enroute" in stt:
+                status_map[uname] = "enroute"
+            elif prev not in ("onsite","enroute") and "assigned" in stt:
+                status_map[uname] = "assigned"
+            else:
+                status_map.setdefault(uname, prev)
+        return status_map
+    finally:
+        s.close()
+
+# --- Helper: last N pings per technician (for path history) ---
+def get_tech_paths(limit_per_tech: int = 50, since_minutes: int = 240):
+    """
+    Returns dict { tech_username: [ {lat,lon,timestamp} ... ] }
+    Limits results to last N pings per tech or pings since `since_minutes`.
+    """
+    s = get_session()
+    try:
+        cutoff = datetime.utcnow() - timedelta(minutes=since_minutes)
+        q = s.query(LocationPing).filter(LocationPing.timestamp >= cutoff).order_by(LocationPing.tech_username, LocationPing.timestamp.asc())
+        rows = q.all()
+        paths = {}
+        for r in rows:
+            uname = getattr(r, "tech_username", None)
+            if not uname:
+                continue
+            paths.setdefault(uname, []).append({
+                "lat": float(r.latitude),
+                "lon": float(r.longitude),
+                "ts": r.timestamp
+            })
+        # enforce per-tech limit (keep recent)
+        for k, v in list(paths.items()):
+            if len(v) > limit_per_tech:
+                paths[k] = v[-limit_per_tech:]
+        return paths
+    finally:
+        s.close()
+
+# --- Updated render_tech_map with new options ---
+def render_tech_map(zoom=11,
+                    show_lines=False,
+                    filter_tech: str | None = None,
+                    show_paths: bool = False,
+                    path_points_limit: int = 100,
+                    show_heatmap: bool = False,
+                    heatmap_radius_pixels: int = 40,
+                    show_assigned_leads: bool = False):
+    """
+    Enhanced map renderer:
+      - color coding by tech status
+      - optional lines to assigned lead pings
+      - optional path history lines
+      - optional heatmap
+      - filter by single technician
+    """
+    tech_locs = get_latest_tech_locations()
+    if not tech_locs:
+        st.info("No technician location pings available.")
+        return
+
+    # Apply technician filter if requested
+    if filter_tech:
+        tech_locs = [t for t in tech_locs if t["tech_username"] == filter_tech]
+        if not tech_locs:
+            st.info(f"No location pings for {filter_tech}.")
+            return
+
+    df = pd.DataFrame(tech_locs)
+    # derive center (if single tech, center on them)
+    center_lat = float(df["latitude"].mean())
+    center_lon = float(df["longitude"].mean())
+
+    # get tech statuses
+    status_map = get_tech_status_map()
+
+    # color mapping by status
+    COLOR_BY_STATUS = {
+        "idle": [120, 120, 120],       # gray
+        "assigned": [0, 122, 255],     # blue
+        "enroute": [255, 165, 0],      # orange
+        "onsite": [34, 197, 94],       # green
+        # fallback
+        "unknown": [200, 30, 60]
+    }
+
+    # attach color column based on status_map
+    def _color_for_row(r):
+        uname = r.get("tech_username")
+        stt = status_map.get(uname, "unknown")
+        return COLOR_BY_STATUS.get(stt, COLOR_BY_STATUS["unknown"])
+
+    df["fill_color"] = df.apply(lambda r: _color_for_row(r), axis=1)
+    df["radius"] = df.apply(lambda r: 60 if status_map.get(r["tech_username"], "") in ("enroute","onsite") else 35, axis=1)
+    df["label"] = df.apply(lambda r: f"{r['tech_username']} ({status_map.get(r['tech_username'],'unknown')})", axis=1)
+
+    layers = []
+
+    # Scatter layer for technicians (color-coded)
+    scatter = pdk.Layer(
+        "ScatterplotLayer",
+        df,
+        pickable=True,
+        get_position=["longitude", "latitude"],
+        get_fill_color="fill_color",
+        get_radius="radius",
+        radius_scale=1,
+        radius_min_pixels=6,
+        radius_max_pixels=120,
+        auto_highlight=True,
+    )
+    layers.append(scatter)
+
+    # Optional: show path history as LineLayer per tech
+    if show_paths:
+        paths = get_tech_paths(limit_per_tech=path_points_limit, since_minutes=720)
+        arc_data = []
+        for tech, pts in paths.items():
+            if filter_tech and tech != filter_tech:
+                continue
+            if len(pts) < 2:
+                continue
+            # build sequential line segments for this tech
+            for i in range(len(pts)-1):
+                a = pts[i]
+                b = pts[i+1]
+                arc_data.append({
+                    "source_lon": float(a["lon"]),
+                    "source_lat": float(a["lat"]),
+                    "target_lon": float(b["lon"]),
+                    "target_lat": float(b["lat"]),
+                    "tech": tech,
+                })
+        if arc_data:
+            arc_df = pd.DataFrame(arc_data)
+            arc_layer = pdk.Layer(
+                "LineLayer",
+                arc_df,
+                get_source_position=["source_lon", "source_lat"],
+                get_target_position=["target_lon", "target_lat"],
+                get_width=3,
+                get_color=[60, 120, 180],
+                pickable=False,
+            )
+            layers.append(arc_layer)
+
+    # Optional: heatmap (all pings)
+    if show_heatmap:
+        # collect recent pings (last 24h)
+        s = get_session()
+        try:
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            pings = s.query(LocationPing).filter(LocationPing.timestamp >= cutoff).all()
+            if pings:
+                heat = pd.DataFrame([{"lat": float(p.latitude), "lon": float(p.longitude)} for p in pings])
+                heat["position"] = heat.apply(lambda r: [r["lon"], r["lat"]], axis=1)
+                heat_layer = pdk.Layer(
+                    "HeatmapLayer",
+                    heat,
+                    get_position="position",
+                    aggregation=pdk.types.String("MEAN"),
+                    radiusPixels=heatmap_radius_pixels,
+                )
+                layers.append(heat_layer)
+        finally:
+            s.close()
+
+    # Optional: draw lines from tech to lead latest ping
+    if show_lines or show_assigned_leads:
+        s = get_session()
+        try:
+            lead_markers = []
+            arc_data = []
+            for r in tech_locs:
+                lid = r.get("lead_id")
+                if not lid:
+                    continue
+                lead_ping = s.query(LocationPing).filter(LocationPing.lead_id == lid).order_by(LocationPing.timestamp.desc()).first()
+                if not lead_ping:
+                    continue
+                # lead marker
+                lead_markers.append({
+                    "lead_id": lid,
+                    "latitude": float(lead_ping.latitude),
+                    "longitude": float(lead_ping.longitude)
+                })
+                # arc from tech to lead
+                if show_lines:
+                    arc_data.append({
+                        "source_lon": float(r["longitude"]),
+                        "source_lat": float(r["latitude"]),
+                        "target_lon": float(lead_ping.longitude),
+                        "target_lat": float(lead_ping.latitude),
+                        "tech": r["tech_username"],
+                        "lead_id": lid
+                    })
+            if lead_markers and show_assigned_leads:
+                lead_df = pd.DataFrame(lead_markers)
+                lead_layer = pdk.Layer(
+                    "IconLayer",
+                    lead_df,
+                    get_icon="get_icon",
+                    get_position=["longitude", "latitude"],
+                    size_scale=15,
+                    pickable=True,
+                    icon_mapping={
+                        "marker": {"x": 0, "y": 0, "width": 128, "height": 128, "anchorY": 128, "anchorX": 64}
+                    }
+                )
+                # build a column with get_icon info
+                lead_df["get_icon"] = {
+                    "url": "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas.png",
+                    "width": 128, "height": 128, "anchorY": 128, "anchorX": 64
+                }
+                layers.append(lead_layer)
+            if arc_data:
+                arc_df = pd.DataFrame(arc_data)
+                arc_layer = pdk.Layer(
+                    "ArcLayer",
+                    arc_df,
+                    get_source_position=["source_lon", "source_lat"],
+                    get_target_position=["target_lon", "target_lat"],
+                    get_width=3,
+                    get_tilt=15,
+                    get_source_color=[0, 128, 200],
+                    get_target_color=[200, 0, 80],
+                )
+                layers.append(arc_layer)
+        finally:
+            s.close()
+
+    # view state and deck
+    view_state = pdk.ViewState(latitude=float(center_lat), longitude=float(center_lon), zoom=zoom, pitch=0)
+    tooltip = {"html": "<b>{label}</b><br/>Tech: {tech_username}<br/>Last ping: {timestamp}", "style": {"color": "white"}}
+
+    deck = pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", initial_view_state=view_state, layers=layers, tooltip=tooltip)
+
+    st.pydeck_chart(deck, use_container_width=True)
 
 # ---------- BEGIN BLOCK C.1: TECH / ASSIGNMENT HELPERS ----------
 def get_assignments_for_technician(technician_username: str, only_open: bool = True):
@@ -1172,7 +1456,17 @@ def page_dashboard():
     if inline_refresh:
         # default 20 sec
         st.markdown('<meta http-equiv="refresh" content="20">', unsafe_allow_html=True)
-    render_tech_map(show_lines=inline_show_lines, height=420, zoom=11)
+        
+    # -- put the technician filter code above as previously described --
+render_tech_map(
+    zoom=11,
+    show_lines=inline_show_lines,
+    filter_tech=None if selected_tech == "All Technicians" else selected_tech,
+    show_paths=False,
+    show_heatmap=False,
+    show_assigned_leads=True
+)
+
 
     st.markdown("### 📋 All Leads (expand a card to edit / change status)")
 
