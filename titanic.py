@@ -205,6 +205,13 @@ def safe_migrate_new_tables():
 
 # Run it once on startup (safe)
 safe_migrate_new_tables()
+
+# Force creation of technician-related tables on first launch
+Base.metadata.create_all(bind=engine, tables=[
+    Technician.__table__,
+    InspectionAssignment.__table__,
+    LocationPing.__table__
+])
 # ---------- END BLOCK B ----------
 
 # ----------------------
@@ -295,7 +302,23 @@ def get_technicians_df(active_only=True):
         if active_only:
             q = q.filter(Technician.active == True)
         rows = q.order_by(Technician.created_at.desc()).all()
-        return pd.DataFrame([{"username": r.username, "full_name": r.full_name, "phone": r.phone, "specialization": r.specialization, "active": r.active} for r in rows])
+        
+        # ALWAYS return these columns, even if empty
+        df = pd.DataFrame([
+            {
+                "username": r.username,
+                "full_name": r.full_name or "",
+                "phone": r.phone or "",
+                "specialization": r.specialization or "Tech",
+                "active": r.active
+            } for r in rows
+        ])
+        
+        # If completely empty, return empty DF with correct columns
+        if df.empty:
+            df = pd.DataFrame(columns=["username", "full_name", "phone", "specialization", "active"])
+        
+        return df
     finally:
         s.close()
 
@@ -326,7 +349,9 @@ def get_assignments_for_lead(lead_id: str):
     finally:
         s.close()
 
-
+def get_technician_usernames(active_only=True):
+    df = get_technicians_df(active_only=active_only)
+    return sorted(df["username"].dropna().unique().tolist())
 # ======================================================================
 # 🔵 TECHNICIAN LOCATION & MAP SYSTEM (COMPLETE + CORRECT)
 # ======================================================================
@@ -496,7 +521,7 @@ def page_technician_map():
 
     # Render map
    # controls on page_technician_map
-filter_choice = st.selectbox("Filter technician", options=["All"] + get_technicians_df(active_only=True)["username"].tolist(), index=0)
+filter_choice = st.selectbox("Filter technician", options=["All"] + get_technician_usernames(active_only=True), index=0)
 show_paths = st.checkbox("Show path history", value=False)
 show_heatmap = st.checkbox("Show heatmap (last 24h)", value=False)
 show_assigned = st.checkbox("Show assigned lead markers", value=False)
@@ -1464,7 +1489,7 @@ if inline_refresh:
 # ---------------------------
 filter_choice = st.selectbox(
     "Filter technician",
-    options=["All"] + get_technicians_df(active_only=True)["username"].tolist(),
+    options=["All"] + get_technician_usernames(active_only=True),
     index=0
 )
 
