@@ -1513,7 +1513,7 @@ def page_tasks():
                 try:
                     update_task_status(task_id=sel, status=new_status, assigned_to=new_assignee or None)
                     st.success("Task updated")
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error("Failed to update task: " + str(e))
 
@@ -1551,7 +1551,7 @@ def page_technician_mobile():
                     ok = update_assignment_status(assignment_id=it['id'], status=new_status or None, note=note or None, mark_lead_inspection_completed=(new_status=="completed"))
                     if ok:
                         st.success("Updated")
-                        st.experimental_rerun()
+                        st.rerun()
                     else:
                         st.error("Update failed")
                 except Exception as e:
