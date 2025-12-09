@@ -1458,14 +1458,21 @@ def page_dashboard():
         st.markdown('<meta http-equiv="refresh" content="20">', unsafe_allow_html=True)
         
     # -- put the technician filter code above as previously described --
-render_tech_map(
-    zoom=11,
-    show_lines=inline_show_lines,
-    filter_tech=None if selected_tech == "All Technicians" else selected_tech,
-    show_paths=False,
-    show_heatmap=False,
-    show_assigned_leads=True
-)
+    # controls on page_technician_map
+filter_choice = st.selectbox("Filter technician", options=["All"] + get_technicians_df(active_only=True)["username"].tolist(), index=0)
+show_paths = st.checkbox("Show path history", value=False)
+show_heatmap = st.checkbox("Show heatmap (last 24h)", value=False)
+show_assigned = st.checkbox("Show assigned lead markers", value=False)
+
+    render_tech_map(
+        zoom=st.slider("Zoom", 3, 18, 11),
+        show_lines=st.checkbox("Show lines to assigned lead", value=False),
+        filter_tech=None if filter_choice == "All" else filter_choice,
+        show_paths=show_paths,
+        show_heatmap=show_heatmap,
+        show_assigned_leads=show_assigned
+    )
+
 
 
     st.markdown("### 📋 All Leads (expand a card to edit / change status)")
