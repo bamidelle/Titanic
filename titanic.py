@@ -106,6 +106,7 @@ class LeadHistory(Base):
     new_value = Column(String, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     # ---------- BEGIN BLOCK A: NEW MODELS (Technician, InspectionAssignment, LocationPing) ----------
+# ---------- BEGIN BLOCK A: NEW MODELS ----------
 from sqlalchemy import DateTime as SA_DateTime
 
 class Technician(Base):
@@ -136,6 +137,8 @@ class LocationPing(Base):
     longitude = Column(Float, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
     accuracy = Column(Float, nullable=True)          # optional accuracy (meters)
+# ---------- END BLOCK A ----------
+
 
 # ---------- BEGIN BLOCK TASKS: DB MODEL ----------
 class Task(Base):
@@ -169,7 +172,7 @@ def safe_create_tables():
 safe_create_tables()
 
 
-# Safe migration attempt (best-effort add missing columns)
+# ---------- BEGIN BLOCK B: SAFE MIGRATION / CREATE NEW TABLES ----------
 def safe_migrate():
     try:
         inspector = inspect(engine)
@@ -186,14 +189,27 @@ def safe_migrate():
             for col, typ in desired.items():
                 if col not in existing:
                     try:
-                        conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {typ}")
+                        conn.execute(text(f"ALTER TABLE leads ADD COLUMN {col} {typ}"))
                     except Exception:
                         pass
             conn.close()
     except Exception:
         pass
 
+def safe_migrate_new_tables():
+    try:
+        # create any missing tables for current models (non-destructive)
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        pass
+
+# run at startup
 safe_migrate()
+safe_migrate_new_tables()
+# ---------- END BLOCK B ----------
+
+
+
 # ---------- BEGIN BLOCK B: SAFE MIGRATION / CREATE NEW TABLES ----------
 def safe_migrate_new_tables():
     try:
@@ -274,7 +290,6 @@ def leads_to_df(start_date=None, end_date=None):
         return df.reset_index(drop=True)
     finally:
         s.close()
-# ---------- BEGIN BLOCK C: DB HELPERS FOR TECHNICIANS / ASSIGNMENTS / PINGS ----------
 def add_technician(username: str, full_name: str = "", phone: str = "", specialization: str = "Tech", active: bool = True):
     s = get_session()
     try:
@@ -302,37 +317,31 @@ def get_technicians_df(active_only=True):
         if active_only:
             q = q.filter(Technician.active == True)
         rows = q.order_by(Technician.created_at.desc()).all()
-        
-        # ALWAYS return these columns, even if empty
-        df = pd.DataFrame([
-            {
-                "username": r.username,
-                "full_name": r.full_name or "",
-                "phone": r.phone or "",
-                "specialization": r.specialization or "Tech",
-                "active": r.active
-            } for r in rows
-        ])
-        
-        # If completely empty, return empty DF with correct columns
-        if df.empty:
-            df = pd.DataFrame(columns=["username", "full_name", "phone", "specialization", "active"])
-        
-        return df
+        data = []
+        for r in rows:
+            data.append({"username": r.username, "full_name": r.full_name, "phone": r.phone, "specialization": r.specialization, "active": r.active})
+        return pd.DataFrame(data)
     finally:
         s.close()
+
+def get_technician_usernames(active_only=True):
+    df = get_technicians_df(active_only=active_only)
+    if df is None or df.empty:
+        return []
+    return sorted(df["username"].dropna().unique().tolist())
 
 def create_inspection_assignment(lead_id: str, technician_username: str, notes: str = None):
     s = get_session()
     try:
         ia = InspectionAssignment(lead_id=lead_id, technician_username=technician_username, notes=notes)
         s.add(ia)
-        # optional: also set lead.assigned_to to technician_username (non-destructive)
+        # also non-destructively set lead.assigned_to
         lead = s.query(Lead).filter(Lead.lead_id == lead_id).first()
         if lead:
+            old_assigned = getattr(lead, "assigned_to", None)
             lead.assigned_to = technician_username
             s.add(lead)
-            s.add(LeadHistory(lead_id=lead.lead_id, changed_by="system", field="assigned_to", old_value=str(getattr(lead, "assigned_to", "")), new_value=str(technician_username)))
+            s.add(LeadHistory(lead_id=lead.lead_id, changed_by="system", field="assigned_to", old_value=str(old_assigned or ""), new_value=str(technician_username)))
         s.commit()
         return ia.id
     except Exception:
@@ -341,17 +350,46 @@ def create_inspection_assignment(lead_id: str, technician_username: str, notes: 
     finally:
         s.close()
 
-def get_assignments_for_lead(lead_id: str):
+def get_assignments_for_technician(technician_username: str, only_open: bool = True):
     s = get_session()
     try:
-        rows = s.query(InspectionAssignment).filter(InspectionAssignment.lead_id == lead_id).order_by(InspectionAssignment.assigned_at.desc()).all()
-        return rows
+        q = s.query(InspectionAssignment).filter(InspectionAssignment.technician_username == technician_username)
+        if only_open:
+            q = q.filter(InspectionAssignment.status != "completed")
+        rows = q.order_by(InspectionAssignment.assigned_at.desc()).all()
+        results = []
+        for r in rows:
+            lead = s.query(Lead).filter(Lead.lead_id == r.lead_id).first() if getattr(r, "lead_id", None) else None
+            results.append({
+                "id": r.id,
+                "lead_id": r.lead_id,
+                "assigned_at": r.assigned_at.isoformat() if r.assigned_at else None,
+                "status": r.status,
+                "notes": r.notes,
+                "lead": {
+                    "contact_name": getattr(lead, "contact_name", None) if lead else None,
+                    "property_address": getattr(lead, "property_address", None) if lead else None,
+                    "stage": getattr(lead, "stage", None) if lead else None,
+                    "estimated_value": float(getattr(lead, "estimated_value", 0) or 0) if lead else 0
+                }
+            })
+        return results
     finally:
         s.close()
 
-def get_technician_usernames(active_only=True):
-    df = get_technicians_df(active_only=active_only)
-    return sorted(df["username"].dropna().unique().tolist())
+def persist_location_ping(tech_username: str, latitude: float, longitude: float, lead_id: str = None, accuracy: float = None, timestamp: datetime = None):
+    s = get_session()
+    try:
+        ping = LocationPing(tech_username=tech_username, latitude=float(latitude), longitude=float(longitude), lead_id=lead_id, accuracy=accuracy, timestamp=timestamp or datetime.utcnow())
+        s.add(ping)
+        s.commit()
+        return ping.id
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+# ---------- END BLOCK C ----------
 # ======================================================================
 # 🔵 TECHNICIAN LOCATION & MAP SYSTEM (COMPLETE + CORRECT)
 # ======================================================================
@@ -399,68 +437,124 @@ def get_latest_tech_locations():
 
 
 # ======================================================================
-# 2) RENDER INTERACTIVE MAP (TECH LOCATIONS + ARC LINES)
-# ======================================================================
-def render_tech_map(zoom=11, show_lines=False):
-    tech_locs = get_latest_tech_locations()
+# ---------- BEGIN BLOCK MAP HELPERS & RENDER ----------
+import pydeck as pdk
+from datetime import timedelta
 
+def get_latest_tech_locations():
+    """Return latest ping per tech"""
+    s = get_session()
+    try:
+        rows = s.query(LocationPing).order_by(LocationPing.tech_username, LocationPing.timestamp.desc()).all()
+        latest = {}
+        for r in rows:
+            uname = getattr(r, "tech_username", None)
+            if not uname:
+                continue
+            if uname not in latest:
+                latest[uname] = {
+                    "tech_username": uname,
+                    "latitude": float(r.latitude),
+                    "longitude": float(r.longitude),
+                    "timestamp": r.timestamp,
+                    "accuracy": float(r.accuracy) if r.accuracy is not None else None,
+                    "lead_id": getattr(r, "lead_id", None)
+                }
+        return list(latest.values())
+    finally:
+        s.close()
+
+def get_tech_status_map():
+    s = get_session()
+    try:
+        techs = s.query(Technician).all()
+        status_map = {t.username: "idle" for t in techs if getattr(t, "username", None)}
+        rows = s.query(InspectionAssignment).filter(InspectionAssignment.technician_username != None).all()
+        for r in rows:
+            uname = r.technician_username
+            stt = (r.status or "").lower()
+            if not uname:
+                continue
+            prev = status_map.get(uname, "idle")
+            if "onsite" in stt:
+                status_map[uname] = "onsite"
+            elif prev != "onsite" and "enroute" in stt:
+                status_map[uname] = "enroute"
+            elif prev not in ("onsite","enroute") and "assigned" in stt:
+                status_map[uname] = "assigned"
+            else:
+                status_map.setdefault(uname, prev)
+        return status_map
+    finally:
+        s.close()
+
+def render_tech_map(zoom=11, show_lines=False, filter_tech: str | None = None, show_paths: bool = False,
+                    path_points_limit: int = 100, show_heatmap: bool = False, heatmap_radius_pixels: int = 40,
+                    show_assigned_leads: bool = False, height: int = 420):
+    # load latest locations
+    tech_locs = get_latest_tech_locations()
     if not tech_locs:
-        st.info("No technician location data yet.")
+        st.info("No technician location pings available.")
         return
 
+    if filter_tech:
+        tech_locs = [t for t in tech_locs if t["tech_username"] == filter_tech]
+        if not tech_locs:
+            st.info(f"No location pings for {filter_tech}.")
+            return
+
     df = pd.DataFrame(tech_locs)
+    center_lat = float(df["latitude"].mean())
+    center_lon = float(df["longitude"].mean())
+    status_map = get_tech_status_map()
 
-    # Compute center (average lat/lon)
-    center = (df["latitude"].mean(), df["longitude"].mean())
+    # color vector by status
+    def color_for_status(uname):
+        stt = status_map.get(uname, "unknown")
+        return {
+            "idle": [120,120,120],
+            "assigned": [0,122,255],
+            "enroute": [255,165,0],
+            "onsite": [34,197,94],
+            "unknown": [200,30,60]
+        }.get(stt, [200,30,60])
 
-    # Base layer: technician markers
+    # attach color to df
+    df["color"] = df["tech_username"].apply(lambda u: color_for_status(u))
+    # convert color lists to arrays for pydeck
+    df["py_color"] = df["color"].tolist()
+
     scatter = pdk.Layer(
         "ScatterplotLayer",
         df,
         get_position=["longitude", "latitude"],
-        get_radius=80,
-        get_color=[255, 0, 0],
+        get_radius=60,
+        get_color="py_color",
         pickable=True,
     )
 
     tooltip = {
-        "html": (
-            "<b>Technician:</b> {tech_username}<br/>"
-            "<b>Time:</b> {timestamp}<br/>"
-            "<b>Lead:</b> {lead_id}<br/>"
-            "<b>Accuracy:</b> {accuracy}"
-        ),
-        "style": {"color": "white"},
+        "html": "<b>Technician:</b> {tech_username} <br/> <b>Time:</b> {timestamp} <br/> <b>Lead:</b> {lead_id} <br/> <b>Accuracy:</b> {accuracy}",
+        "style": {"color": "white"}
     }
 
     layers = [scatter]
 
-    # OPTIONAL LINES (tech → lead)
-    if show_lines:
+    # optional arc/lines from tech->lead latest ping
+    if show_lines or show_assigned_leads:
         s = get_session()
         try:
             arcs = []
             for r in tech_locs:
                 lid = r.get("lead_id")
-                if not lid:
-                    continue
-
-                # latest ping for that lead
-                latest_lead_ping = (
-                    s.query(LocationPing)
-                    .filter(LocationPing.lead_id == lid)
-                    .order_by(LocationPing.timestamp.desc())
-                    .first()
-                )
-
-                if latest_lead_ping:
-                    arcs.append({
-                        "source_lon": float(r["longitude"]),
-                        "source_lat": float(r["latitude"]),
-                        "target_lon": float(latest_lead_ping.longitude),
-                        "target_lat": float(latest_lead_ping.latitude),
-                    })
-
+                if lid:
+                    lead_ping = s.query(LocationPing).filter(LocationPing.lead_id == lid).order_by(LocationPing.timestamp.desc()).first()
+                    if lead_ping:
+                        arcs.append({
+                            "source_lon": float(r["longitude"]), "source_lat": float(r["latitude"]),
+                            "target_lon": float(lead_ping.longitude), "target_lat": float(lead_ping.latitude),
+                            "tech": r["tech_username"], "lead_id": lid
+                        })
             if arcs:
                 arc_df = pd.DataFrame(arcs)
                 arc_layer = pdk.Layer(
@@ -469,32 +563,19 @@ def render_tech_map(zoom=11, show_lines=False):
                     get_source_position=["source_lon", "source_lat"],
                     get_target_position=["target_lon", "target_lat"],
                     get_width=4,
-                    get_tilt=15,
                     pickable=False,
-                    get_source_color=[0, 128, 200],
-                    get_target_color=[200, 0, 80],
+                    get_source_color=[0,128,200],
+                    get_target_color=[200,0,80],
                 )
                 layers.append(arc_layer)
-
         finally:
             s.close()
 
-    # VIEW STATE
-    view_state = pdk.ViewState(
-        latitude=float(center[0]),
-        longitude=float(center[1]),
-        zoom=zoom,
-        pitch=0,
-    )
-
-    deck = pdk.Deck(
-        layers=layers,
-        tooltip=tooltip,
-        initial_view_state=view_state,
-        map_style="mapbox://styles/mapbox/light-v9",
-    )
-
+    view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom, pitch=0)
+    deck = pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", initial_view_state=view_state, layers=layers, tooltip=tooltip)
     st.pydeck_chart(deck, use_container_width=True)
+# ---------- END BLOCK MAP ----------
+
 
 
 # ======================================================================
@@ -608,206 +689,6 @@ def get_tech_paths(limit_per_tech: int = 50, since_minutes: int = 240):
     finally:
         s.close()
 
-# --- Updated render_tech_map with new options ---
-def render_tech_map(zoom=11,
-                    show_lines=False,
-                    filter_tech: str | None = None,
-                    show_paths: bool = False,
-                    path_points_limit: int = 100,
-                    show_heatmap: bool = False,
-                    heatmap_radius_pixels: int = 40,
-                    show_assigned_leads: bool = False):
-    """
-    Enhanced map renderer:
-      - color coding by tech status
-      - optional lines to assigned lead pings
-      - optional path history lines
-      - optional heatmap
-      - filter by single technician
-    """
-    tech_locs = get_latest_tech_locations()
-    if not tech_locs:
-        st.info("No technician location pings available.")
-        return
-
-    # Apply technician filter if requested
-    if filter_tech:
-        tech_locs = [t for t in tech_locs if t["tech_username"] == filter_tech]
-        if not tech_locs:
-            st.info(f"No location pings for {filter_tech}.")
-            return
-
-    df = pd.DataFrame(tech_locs)
-    # derive center (if single tech, center on them)
-    center_lat = float(df["latitude"].mean())
-    center_lon = float(df["longitude"].mean())
-
-    # get tech statuses
-    status_map = get_tech_status_map()
-
-    # color mapping by status
-    COLOR_BY_STATUS = {
-        "idle": [120, 120, 120],       # gray
-        "assigned": [0, 122, 255],     # blue
-        "enroute": [255, 165, 0],      # orange
-        "onsite": [34, 197, 94],       # green
-        # fallback
-        "unknown": [200, 30, 60]
-    }
-
-    # attach color column based on status_map
-    def _color_for_row(r):
-        uname = r.get("tech_username")
-        stt = status_map.get(uname, "unknown")
-        return COLOR_BY_STATUS.get(stt, COLOR_BY_STATUS["unknown"])
-
-    df["fill_color"] = df.apply(lambda r: _color_for_row(r), axis=1)
-    df["radius"] = df.apply(lambda r: 60 if status_map.get(r["tech_username"], "") in ("enroute","onsite") else 35, axis=1)
-    df["label"] = df.apply(lambda r: f"{r['tech_username']} ({status_map.get(r['tech_username'],'unknown')})", axis=1)
-
-    layers = []
-
-    # Scatter layer for technicians (color-coded)
-    scatter = pdk.Layer(
-        "ScatterplotLayer",
-        df,
-        pickable=True,
-        get_position=["longitude", "latitude"],
-        get_fill_color="fill_color",
-        get_radius="radius",
-        radius_scale=1,
-        radius_min_pixels=6,
-        radius_max_pixels=120,
-        auto_highlight=True,
-    )
-    layers.append(scatter)
-
-    # Optional: show path history as LineLayer per tech
-    if show_paths:
-        paths = get_tech_paths(limit_per_tech=path_points_limit, since_minutes=720)
-        arc_data = []
-        for tech, pts in paths.items():
-            if filter_tech and tech != filter_tech:
-                continue
-            if len(pts) < 2:
-                continue
-            # build sequential line segments for this tech
-            for i in range(len(pts)-1):
-                a = pts[i]
-                b = pts[i+1]
-                arc_data.append({
-                    "source_lon": float(a["lon"]),
-                    "source_lat": float(a["lat"]),
-                    "target_lon": float(b["lon"]),
-                    "target_lat": float(b["lat"]),
-                    "tech": tech,
-                })
-        if arc_data:
-            arc_df = pd.DataFrame(arc_data)
-            arc_layer = pdk.Layer(
-                "LineLayer",
-                arc_df,
-                get_source_position=["source_lon", "source_lat"],
-                get_target_position=["target_lon", "target_lat"],
-                get_width=3,
-                get_color=[60, 120, 180],
-                pickable=False,
-            )
-            layers.append(arc_layer)
-
-    # Optional: heatmap (all pings)
-    if show_heatmap:
-        # collect recent pings (last 24h)
-        s = get_session()
-        try:
-            cutoff = datetime.utcnow() - timedelta(hours=24)
-            pings = s.query(LocationPing).filter(LocationPing.timestamp >= cutoff).all()
-            if pings:
-                heat = pd.DataFrame([{"lat": float(p.latitude), "lon": float(p.longitude)} for p in pings])
-                heat["position"] = heat.apply(lambda r: [r["lon"], r["lat"]], axis=1)
-                heat_layer = pdk.Layer(
-                    "HeatmapLayer",
-                    heat,
-                    get_position="position",
-                    aggregation=pdk.types.String("MEAN"),
-                    radiusPixels=heatmap_radius_pixels,
-                )
-                layers.append(heat_layer)
-        finally:
-            s.close()
-
-    # Optional: draw lines from tech to lead latest ping
-    if show_lines or show_assigned_leads:
-        s = get_session()
-        try:
-            lead_markers = []
-            arc_data = []
-            for r in tech_locs:
-                lid = r.get("lead_id")
-                if not lid:
-                    continue
-                lead_ping = s.query(LocationPing).filter(LocationPing.lead_id == lid).order_by(LocationPing.timestamp.desc()).first()
-                if not lead_ping:
-                    continue
-                # lead marker
-                lead_markers.append({
-                    "lead_id": lid,
-                    "latitude": float(lead_ping.latitude),
-                    "longitude": float(lead_ping.longitude)
-                })
-                # arc from tech to lead
-                if show_lines:
-                    arc_data.append({
-                        "source_lon": float(r["longitude"]),
-                        "source_lat": float(r["latitude"]),
-                        "target_lon": float(lead_ping.longitude),
-                        "target_lat": float(lead_ping.latitude),
-                        "tech": r["tech_username"],
-                        "lead_id": lid
-                    })
-            if lead_markers and show_assigned_leads:
-                lead_df = pd.DataFrame(lead_markers)
-                lead_layer = pdk.Layer(
-                    "IconLayer",
-                    lead_df,
-                    get_icon="get_icon",
-                    get_position=["longitude", "latitude"],
-                    size_scale=15,
-                    pickable=True,
-                    icon_mapping={
-                        "marker": {"x": 0, "y": 0, "width": 128, "height": 128, "anchorY": 128, "anchorX": 64}
-                    }
-                )
-                # build a column with get_icon info
-                lead_df["get_icon"] = {
-                    "url": "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas.png",
-                    "width": 128, "height": 128, "anchorY": 128, "anchorX": 64
-                }
-                layers.append(lead_layer)
-            if arc_data:
-                arc_df = pd.DataFrame(arc_data)
-                arc_layer = pdk.Layer(
-                    "ArcLayer",
-                    arc_df,
-                    get_source_position=["source_lon", "source_lat"],
-                    get_target_position=["target_lon", "target_lat"],
-                    get_width=3,
-                    get_tilt=15,
-                    get_source_color=[0, 128, 200],
-                    get_target_color=[200, 0, 80],
-                )
-                layers.append(arc_layer)
-        finally:
-            s.close()
-
-    # view state and deck
-    view_state = pdk.ViewState(latitude=float(center_lat), longitude=float(center_lon), zoom=zoom, pitch=0)
-    tooltip = {"html": "<b>{label}</b><br/>Tech: {tech_username}<br/>Last ping: {timestamp}", "style": {"color": "white"}}
-
-    deck = pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", initial_view_state=view_state, layers=layers, tooltip=tooltip)
-
-    st.pydeck_chart(deck, use_container_width=True)
-
 # ---------- BEGIN BLOCK C.1: TECH / ASSIGNMENT HELPERS ----------
 def get_assignments_for_technician(technician_username: str, only_open: bool = True):
     """
@@ -873,18 +754,7 @@ def update_assignment_status(assignment_id: int, status: str = None, note: str =
         s.close()
 # ---------- END BLOCK C.1 ----------
 
-def persist_location_ping(tech_username: str, latitude: float, longitude: float, lead_id: str = None, accuracy: float = None, timestamp: datetime = None):
-    s = get_session()
-    try:
-        ping = LocationPing(tech_username=tech_username, latitude=float(latitude), longitude=float(longitude), lead_id=lead_id, accuracy=accuracy, timestamp=timestamp or datetime.utcnow())
-        s.add(ping)
-        s.commit()
-        return ping.id
-    except Exception:
-        s.rollback()
-        raise
-    finally:
-        s.close()
+
 
 # ---------- BEGIN BLOCK TASK HELPERS ----------
 def create_task(task_type: str, description: str, lead_id: str = None, priority: str = "Medium",
@@ -1553,100 +1423,67 @@ if df_view.empty:
 
 # -----------------------------
 # Leads List
-# -----------------------------
-    for _, lead in df_view.sort_values("created_at", ascending=False).head(200).iterrows():
+# ---------- PIPELINE LEADS LOOP (corrected) ----------
+for _, lead in df_view.sort_values("created_at", ascending=False).head(200).iterrows():
+    with st.expander(f"#{lead['lead_id']} — {lead.get('contact_name') or 'No name'} — {lead.get('stage')}", expanded=False):
+        left, right = st.columns([3,1])
+        with left:
+            st.write(f"**Source:** {lead.get('source') or ''}  |  **Assigned:** {lead.get('assigned_to') or ''}")
+            st.write(f"**Address:** {lead.get('property_address') or ''}")
+            st.write(f"**Contact:** {lead.get('contact_name') or ''} / {lead.get('contact_phone') or ''} / {lead.get('contact_email') or ''}")
+            st.write(f"**Notes:** {lead.get('notes') or ''}")
+            st.write(f"**Created:** {lead.get('created_at')}")
+        with right:
+            sla_sec, overdue = calculate_remaining_sla(lead.get("sla_entered_at") or lead.get("created_at"), lead.get("sla_hours"))
+            if overdue:
+                st.markdown("<div style='color:#dc2626;font-weight:700;'>❗ OVERDUE</div>", unsafe_allow_html=True)
+            else:
+                hours = int(sla_sec // 3600)
+                mins = int((sla_sec % 3600) // 60)
+                st.markdown(f"<div class='small-muted'>⏳ {hours}h {mins}m left</div>", unsafe_allow_html=True)
 
-        with st.expander(f"#{lead['lead_id']} — {lead.get('contact_name') or 'No name'} — {lead.get('stage')}", expanded=False):
+        # --------- Update form (inside expander) ----------
+        with st.form(f"update_{lead['lead_id']}", clear_on_submit=False):
+            new_stage = st.selectbox("Status", PIPELINE_STAGES, index=PIPELINE_STAGES.index(lead.get("stage")) if lead.get("stage") in PIPELINE_STAGES else 0, key=f"stage_{lead['lead_id']}")
+            new_assigned = st.text_input("Assigned to (username)", value=lead.get("assigned_to") or "", key=f"assigned_{lead['lead_id']}")
+            new_est = st.number_input("Estimated value (USD)", value=float(lead.get("estimated_value") or 0.0), min_value=0.0, step=100.0, key=f"est_{lead['lead_id']}")
+            new_cost = st.number_input("Cost to acquire lead (USD)", value=float(lead.get("ad_cost") or 0.0), min_value=0.0, step=1.0, key=f"cost_{lead['lead_id']}")
+            new_notes = st.text_area("Notes", value=lead.get("notes") or "", key=f"notes_{lead['lead_id']}")
+            submitted = st.form_submit_button("Save changes", key=f"save_changes_{lead['lead_id']}")
+            if submitted:
+                try:
+                    upsert_lead_record({
+                        "lead_id": lead["lead_id"],
+                        "stage": new_stage,
+                        "assigned_to": new_assigned or None,
+                        "estimated_value": new_est,
+                        "ad_cost": new_cost,
+                        "notes": new_notes
+                    }, actor="admin")
+                    st.success("Lead updated")
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error("Failed to update lead: " + str(e))
 
-            left, right = st.columns([3,1])
-            with left:
-                st.write(f"**Source:** {lead.get('source') or ''}  |  **Assigned:** {lead.get('assigned_to') or ''}")
-                st.write(f"**Address:** {lead.get('property_address') or ''}")
-                st.write(f"**Contact:** {lead.get('contact_name') or ''} / {lead.get('contact_phone') or ''} / {lead.get('contact_email') or ''}")
-                st.write(f"**Notes:** {lead.get('notes') or ''}")
-                st.write(f"**Created:** {lead.get('created_at')}")
+        # --------- Technician Assignment (OUTSIDE FORM) ----------
+        st.markdown("### Technician Assignment")
+        techs_df = get_technicians_df(active_only=True)
+        tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
+        selected_tech = st.selectbox("Assign Technician (active)", options=tech_options, index=0, key=f"tech_select_{lead['lead_id']}")
+        assign_notes = st.text_area("Assignment notes (optional)", value="", key=f"tech_notes_{lead['lead_id']}")
+        if st.button(f"Assign Technician to {lead['lead_id']}", key=f"assign_btn_{lead['lead_id']}"):
+            if not selected_tech:
+                st.error("Select a technician")
+            else:
+                try:
+                    create_inspection_assignment(lead_id=lead["lead_id"], technician_username=selected_tech, notes=assign_notes)
+                    upsert_lead_record({"lead_id": lead["lead_id"], "inspection_scheduled": True, "stage": "Inspection Scheduled"}, actor="admin")
+                    st.success(f"Assigned {selected_tech} to lead {lead['lead_id']}")
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error("Failed to assign: " + str(e))
+# ---------- END PIPELINE LEADS LOOP ----------
 
-            with right:
-                sla_sec, overdue = calculate_remaining_sla(lead.get("sla_entered_at") or lead.get("created_at"), lead.get("sla_hours"))
-                if overdue:
-                    st.markdown("<div style='color:#dc2626;font-weight:700;'>❗ OVERDUE</div>", unsafe_allow_html=True)
-                else:
-                    hours = int(sla_sec // 3600)
-                    mins = int((sla_sec % 3600) // 60)
-                    st.markdown(f"<div class='small-muted'>⏳ {hours}h {mins}m left</div>", unsafe_allow_html=True)
-
-            # -------------------------
-            # UPDATE FORM
-            # -------------------------
-            with st.form(f"update_{lead['lead_id']}", clear_on_submit=False):
-
-                new_stage = st.selectbox("Status", PIPELINE_STAGES,
-                                         index=PIPELINE_STAGES.index(lead.get("stage")) if lead.get("stage") in PIPELINE_STAGES else 0)
-
-                new_assigned = st.text_input("Assigned to (username)", value=lead.get("assigned_to") or "")
-                new_est = st.number_input("Estimated value (USD)", value=float(lead.get("estimated_value") or 0.0), min_value=0.0, step=100.0)
-                new_cost = st.number_input("Cost to acquire lead (USD)", value=float(lead.get("ad_cost") or 0.0), min_value=0.0, step=1.0)
-                new_notes = st.text_area("Notes", value=lead.get("notes") or "")
-
-                submitted = st.form_submit_button("Save changes")
-                if submitted:
-                    try:
-                        upsert_lead_record({
-                            "lead_id": lead["lead_id"],
-                            "stage": new_stage,
-                            "assigned_to": new_assigned or None,
-                            "estimated_value": new_est,
-                            "ad_cost": new_cost,
-                            "notes": new_notes
-                        }, actor="admin")
-
-                        st.success("Lead updated")
-                        st.rerun()
-
-                    except Exception as e:
-                        st.error("Failed to update lead: " + str(e))
-                        st.write(traceback.format_exc())
-
-            # -------------------------
-            # TECHNICIAN ASSIGNMENT (BLOCK E)
-            # -------------------------
-            st.markdown("### Technician Assignment")
-
-            techs_df = get_technicians_df(active_only=True)
-            tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
-
-            selected_tech = st.selectbox(
-                "Assign Technician (active)",
-                options=tech_options,
-                index=0,
-                key=f"tech_select_{lead['lead_id']}"
-            )
-
-            assign_notes = st.text_area(
-                "Assignment notes (optional)",
-                value="",
-                key=f"tech_notes_{lead['lead_id']}"
-            )
-
-            if st.button(f"Assign Technician to {lead['lead_id']}", key=f"assign_btn_{lead['lead_id']}"):
-                if not selected_tech:
-                    st.error("Select a technician")
-                else:
-                    try:
-                        create_inspection_assignment(
-                            lead_id=lead["lead_id"],
-                            technician_username=selected_tech,
-                            notes=assign_notes
-                        )
-
-                        upsert_lead_record({
-                            "lead_id": lead["lead_id"],
-                            "inspection_scheduled": True,
-                            "stage": "Inspection Scheduled"
-                        }, actor="admin")
-
-                        st.success(f"Assigned {selected_tech} to lead {lead['lead_id']}")
-                        st.rerun()
 
                     except Exception as e:
                         st.error("Failed to assign: " + str(e))
