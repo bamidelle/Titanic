@@ -1095,7 +1095,7 @@ else:
     tech_locs = get_latest_tech_locations()
 
         if not tech_locs:
-        st.info("No technician locations yet.")
+            st.info("No technician locations yet.")
             return
 
     df = pd.DataFrame(tech_locs)
