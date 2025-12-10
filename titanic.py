@@ -1178,21 +1178,21 @@ else:
                 s.close()
 
 
-     view_state = pdk.ViewState(
-        latitude=float(center[0]),
-        longitude=float(center[1]),
-        zoom=zoom,
-        pitch=0
-    )
-
-    deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/light-v9",
-        initial_view_state=view_state,
-        layers=layers,
-        tooltip=tooltip
-    )
-
-    st.pydeck_chart(deck, use_container_width=True)
+         view_state = pdk.ViewState(
+            latitude=float(center[0]),
+            longitude=float(center[1]),
+            zoom=zoom,
+            pitch=0
+        )
+    
+        deck = pdk.Deck(
+            map_style="mapbox://styles/mapbox/light-v9",
+            initial_view_state=view_state,
+            layers=layers,
+            tooltip=tooltip
+        )
+    
+        st.pydeck_chart(deck, use_container_width=True)
 
 
 # -----------------------------------------------------
