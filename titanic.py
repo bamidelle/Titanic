@@ -1094,9 +1094,9 @@ else:
     def render_tech_map(zoom=11, show_lines=False):
     tech_locs = get_latest_tech_locations()
 
-    if not tech_locs:
+        if not tech_locs:
         st.info("No technician locations yet.")
-        return
+            return
 
     df = pd.DataFrame(tech_locs)
 
