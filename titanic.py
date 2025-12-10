@@ -333,7 +333,37 @@ def get_assignments_for_lead(lead_id: str):
         return rows
     finally:
         s.close()
-
+def update_assignment_status(assignment_id: int, status: str = None, note: str = None, mark_lead_inspection_completed: bool = False):
+    """
+    Update assignment status and optional note. Optionally also update the associated lead (inspection_completed).
+    Returns True/False.
+    """
+    s = get_session()
+    try:
+        ia = s.query(InspectionAssignment).filter(InspectionAssignment.id == int(assignment_id)).first()
+        if not ia:
+            return False
+        if status:
+            ia.status = status
+        if note is not None:
+            # append note to existing notes
+            existing = ia.notes or ""
+            ts = datetime.utcnow().isoformat()
+            ia.notes = existing + ("\n" if existing else "") + f"{ts} - {note}"
+        s.add(ia)
+        # update lead if requested
+        if mark_lead_inspection_completed and ia.lead_id:
+            lead = s.query(Lead).filter(Lead.lead_id == ia.lead_id).first()
+            if lead:
+                lead.inspection_completed = True
+                s.add(lead)
+        s.commit()
+        return True
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
 
 def persist_location_ping(tech_username: str, latitude: float, longitude: float, lead_id: str = None, accuracy: float = None, timestamp: datetime = None):
     s = get_session()
@@ -635,8 +665,11 @@ with st.sidebar:
         "Pipeline Board",
         "Analytics",
         "CPA & ROI",
+        "AI Recommendations",
         "ML (internal)",
-        "AI Recommendations",   # ← ADD THIS
+        "Technician Mobile",
+        "Technician Map Tracking",   # << add this
+        "Tasks",
         "Settings",
         "Exports"
     ], 
@@ -754,6 +787,22 @@ def alerts_ui():
     else:
         st.markdown("")
 
+# Technician filter for the live map
+st.markdown("### Technician Filter")
+
+tech_df = get_technicians_df(active_only=True)
+
+if tech_df.empty:
+    st.warning("No technicians found. Add them in Settings.")
+    selected_tech = None
+else:
+    tech_list = ["All Technicians"] + tech_df["username"].tolist()
+    selected_tech = st.selectbox(
+        "Show technician",
+        options=tech_list,
+        index=0,
+        key="map_tech_filter"
+    )
 
 
 
@@ -905,8 +954,39 @@ def page_dashboard():
                   </div>
                 </div>
             """, unsafe_allow_html=True)
+    # Technician filter for the live map
+    st.markdown("### Technician Filter")
 
+tech_df = get_technicians_df(active_only=True)
 
+if tech_df.empty:
+    st.warning("No technicians found. Add them in Settings.")
+    selected_tech = None
+else:
+    tech_list = ["All Technicians"] + tech_df["username"].tolist()
+    selected_tech = st.selectbox(
+        "Show technician",
+        options=tech_list,
+        index=0,
+        key="map_tech_filter"
+    )
+
+    
+    st.markdown("---")
+    st.markdown("### Live Technician Map")
+    st.markdown("<em>Latest location for each technician (click Auto-refresh to update automatically).</em>", unsafe_allow_html=True)
+    # small inline control
+    c1, c2 = st.columns([3,1])
+    with c1:
+        inline_show_lines = st.checkbox("Show lines to assigned lead", key="dash_map_lines", value=False)
+    with c2:
+        inline_refresh = st.checkbox("Auto-refresh inline map (meta refresh)", key="dash_map_auto", value=False)
+    if inline_refresh:
+        # default 20 sec
+        st.markdown('<meta http-equiv="refresh" content="20">', unsafe_allow_html=True)
+    render_tech_map(show_lines=inline_show_lines, height=420, zoom=11)
+
+    
     st.markdown("---")
     st.markdown("### 📋 All Leads (expand a card to edit / change status)")
     st.markdown("<em>Expand a lead to edit details, change status, assign owner, and create estimates.</em>", unsafe_allow_html=True)
@@ -988,6 +1068,7 @@ def page_dashboard():
                     except Exception as e:
                         st.error("Failed to update lead: " + str(e))
                         st.write(traceback.format_exc())
+                        
             # Technician assignment (outside form)
             st.markdown("### Technician Assignment")
             techs_df = get_technicians_df(active_only=True)
@@ -1010,8 +1091,132 @@ def page_dashboard():
                     except Exception as e:
                         st.error("Failed to assign: " + str(e))
     # end for
+    def render_tech_map(zoom=11, show_lines=False):
+    tech_locs = get_latest_tech_locations()
 
+    if not tech_locs:
+        st.info("No technician locations yet.")
+        return
 
+    df = pd.DataFrame(tech_locs)
+
+    center = [df["latitude"].mean(), df["longitude"].mean()]
+
+    scatter = pdk.Layer(
+        "ScatterplotLayer",
+        df,
+        get_position=["longitude", "latitude"],
+        get_color=[0, 122, 255],
+        get_radius=50,
+        pickable=True,
+    )
+
+    tooltip = {
+        "html": "<b>Tech:</b> {tech_username}<br/>"
+                "<b>Last Ping:</b> {timestamp}<br/>"
+                "<b>Lead:</b> {lead_id}<br/>"
+                "<b>Accuracy:</b> {accuracy}",
+        "style": {"color": "white"}
+    }
+
+    layers = [scatter]
+
+    if show_lines:
+        s = get_session()
+        try:
+            arcs = []
+            for r in tech_locs:
+                if r["lead_id"]:
+                    lp = (
+                        s.query(LocationPing)
+                        .filter(LocationPing.lead_id == r["lead_id"])
+                        .order_by(LocationPing.timestamp.desc())
+                        .first()
+                    )
+                    if lp:
+                        arcs.append({
+                            "source_lon": r["longitude"],
+                            "source_lat": r["latitude"],
+                            "target_lon": float(lp.longitude),
+                            "target_lat": float(lp.latitude)
+                        })
+
+            if arcs:
+                arc_df = pd.DataFrame(arcs)
+                arc_layer = pdk.Layer(
+                    "ArcLayer",
+                    arc_df,
+                    get_source_position=["source_lon", "source_lat"],
+                    get_target_position=["target_lon", "target_lat"],
+                    get_width=4,
+                    get_tilt=15,
+                )
+                layers.append(arc_layer)
+
+        finally:
+            s.close()
+
+    view_state = pdk.ViewState(
+        latitude=float(center[0]),
+        longitude=float(center[1]),
+        zoom=zoom,
+        pitch=0
+    )
+
+    deck = pdk.Deck(
+        map_style="mapbox://styles/mapbox/light-v9",
+        initial_view_state=view_state,
+        layers=layers,
+        tooltip=tooltip
+    )
+
+    st.pydeck_chart(deck, use_container_width=True)
+
+    def get_latest_tech_locations():
+    s = get_session()
+    try:
+        rows = (
+            s.query(LocationPing)
+            .order_by(LocationPing.tech_username, LocationPing.timestamp.desc())
+            .all()
+        )
+
+        latest = {}
+        for r in rows:
+            tech = r.tech_username
+            if tech not in latest:
+                latest[tech] = {
+                    "tech_username": tech,
+                    "latitude": float(r.latitude),
+                    "longitude": float(r.longitude),
+                    "timestamp": r.timestamp,
+                    "accuracy": r.accuracy,
+                    "lead_id": r.lead_id,
+                }
+        return list(latest.values())
+    finally:
+        s.close()
+
+    def page_technician_map():
+    st.markdown("<div class='header'>🗺️ Technician Map Tracking</div>", unsafe_allow_html=True)
+    st.markdown("<em>Live technician locations — latest ping per tech. Use Auto-refresh to update every N seconds.</em>", unsafe_allow_html=True)
+
+    # Auto-refresh controls (meta refresh)
+    auto = st.checkbox("Enable auto-refresh (meta refresh)", value=False)
+    if auto:
+        secs = st.number_input("Refresh interval (seconds)", min_value=5, max_value=300, value=20, step=5)
+        # add a meta refresh tag (simple, reliable)
+        st.markdown(f'<meta http-equiv="refresh" content="{secs}">', unsafe_allow_html=True)
+
+    # Options
+    c1, c2 = st.columns([2,1])
+    with c1:
+        show_lines = st.checkbox("Show lines to assigned lead (if available)", value=False)
+    with c2:
+        zoom = st.slider("Zoom", min_value=3, max_value=18, value=11)
+
+    # Render map
+    render_tech_map(zoom=zoom, show_lines=show_lines)
 
 
 
@@ -1344,6 +1549,38 @@ def page_ai_recommendations():
 
 
     # End of page
+def page_technician_mobile():
+    st.markdown("<div class='header'>📱 Technician Mobile Preview</div>", unsafe_allow_html=True)
+    st.markdown("<em>Preview of the mobile app for technicians (admin-only).</em>", unsafe_allow_html=True)
+
+    # Load technicians
+    tech_df = get_technicians_df(active_only=True)
+
+    if tech_df.empty:
+        st.warning("No technicians found. Please add technicians in Settings.")
+        return
+
+    tech_list = tech_df["username"].tolist()
+
+    # Dropdown for technician selection
+    uname = st.selectbox(
+        "Select Technician",
+        options=tech_list,
+        index=0,
+        key="mobile_preview_tech"
+    )
+
+    # Fetch assignments
+    try:
+        rows = get_assignments_for_technician(uname, only_open=True)
+    except Exception as e:
+        st.error("Failed to load assignments: " + str(e))
+        return
+
+    if not rows:
+        st.info(f"No open inspections for {uname}")
+        return
+
 
 
 
@@ -1468,13 +1705,17 @@ def page_exports():
             st.error("Failed to import: " + str(e))
 
 
-# ---------- BEGIN BLOCK F: FLASK API FOR LOCATION PINGS (optional but ready) ----------
+# ---------- BEGIN BLOCK F: FLASK API FOR LOCATION PINGS + TECH ENDPOINTS ----------
 try:
     from flask import Flask, request, jsonify
     import threading
+    from datetime import datetime
+
     flask_app = Flask("recapture_pro_api")
 
-
+    # -------------------------------
+    # Existing endpoint: ping location
+    # -------------------------------
     @flask_app.route("/api/ping_location", methods=["POST"])
     def api_ping_location():
         try:
@@ -1493,27 +1734,185 @@ try:
                     ts_parsed = None
             if not tech or lat is None or lon is None:
                 return jsonify({"error":"missing fields (tech_username, latitude, longitude)"}), 400
-            pid = persist_location_ping(tech_username=str(tech), latitude=float(lat), longitude=float(lon), lead_id=lead_id, accuracy=accuracy, timestamp=ts_parsed)
+            pid = persist_location_ping(
+                tech_username=str(tech),
+                latitude=float(lat),
+                longitude=float(lon),
+                lead_id=lead_id,
+                accuracy=accuracy,
+                timestamp=ts_parsed
+            )
             return jsonify({"ok": True, "ping_id": pid}), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    # -------------------------------
+    # Technician mobile endpoints
+    # -------------------------------
+    @flask_app.route("/tech/assignments", methods=["GET"])
+    def api_tech_assignments():
+        """
+        Query params:
+        - username: technician username (required)
+        - open_only: "1" or "0" (optional, default 1)
+        """
+        try:
+            username = request.args.get("username")
+            open_only = request.args.get("open_only", "1") != "0"
+            if not username:
+                return jsonify({"error":"username required"}), 400
+            rows = get_assignments_for_technician(username, only_open=open_only)
+            return jsonify({"ok": True, "assignments": rows}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
+    @flask_app.route("/tech/update_assignment", methods=["POST"])
+    def api_update_assignment():
+        """
+        POST JSON:
+        {
+          "assignment_id": 123,
+          "status": "enroute" | "onsite" | "completed",
+          "note": "optional",
+          "mark_lead_completed": true|false
+        }
+        """
+        try:
+            payload = request.get_json(force=True)
+            aid = payload.get("assignment_id")
+            if not aid:
+                return jsonify({"error":"assignment_id required"}), 400
+            status = payload.get("status")
+            note = payload.get("note")
+            mark_lead = bool(payload.get("mark_lead_completed", False))
+            ok = update_assignment_status(
+                assignment_id=aid,
+                status=status,
+                note=note,
+                mark_lead_inspection_completed=mark_lead
+            )
+            return jsonify({"ok": bool(ok)}), 200 if ok else 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @flask_app.route("/tech/mobile", methods=["GET"])
+    def tech_mobile_shell():
+        html = """<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tech Mobile - ReCapture Pro</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;padding:12px;background:#f7f7f9;}
+    .card{background:#fff;padding:12px;margin-bottom:12px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06)}
+    .btn{display:inline-block;padding:8px 10px;border-radius:6px;border:none;margin:4px 2px;font-size:14px}
+    .btn-primary{background:#0ea5e9;color:#fff}
+    .btn-ghost{background:#eef2ff;color:#111}
+    input,select,textarea{width:100%;padding:8px;margin:6px 0;border-radius:6px;border:1px solid #ddd}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  </style>
+</head>
+<body>
+<header>
+  <h3>ReCapture Pro — Tech</h3>
+  <div>
+    <input id="username" placeholder="Technician username" />
+    <button onclick="loadAssignments()" class="btn btn-primary">Load</button>
+  </div>
+</header>
+<div id="assignments"></div>
+<script>
+async function loadAssignments(){
+  const u = document.getElementById('username').value;
+  if(!u){ alert('enter username'); return; }
+  document.getElementById('assignments').innerHTML = '<div class="card">Loading...</div>';
+  try{
+    const res = await fetch('/tech/assignments?username=' + encodeURIComponent(u));
+    const j = await res.json();
+    if(!j.ok){ document.getElementById('assignments').innerHTML = '<div class="card">Error loading</div>'; return; }
+    renderAssignments(j.assignments, u);
+  }catch(e){
+    document.getElementById('assignments').innerHTML = '<div class="card">Network error</div>';
+  }
+}
+function renderAssignments(items, username){
+  if(!items || items.length===0){
+    document.getElementById('assignments').innerHTML = '<div class="card">No assignments</div>';
+    return;
+  }
+  const container = document.getElementById('assignments');
+  container.innerHTML = '';
+  items.forEach(it => {
+    const lead = it.lead || {};
+    const html = document.createElement('div');
+    html.className = 'card';
+    html.innerHTML = `
+      <div><strong>Lead: ${it.lead_id || '—'}</strong> • <small>${lead.contact_name || ''}</small></div>
+      <div style="margin-top:6px">${lead.property_address || ''}</div>
+      <div style="margin-top:6px">Stage: <strong>${lead.stage || ''}</strong> — Value: $${(lead.estimated_value||0).toLocaleString()}</div>
+      <div style="margin-top:8px">Status: <em id="status_${it.id}">${it.status}</em></div>
+      <div style="margin-top:8px">
+        <select id="select_${it.id}">
+          <option value="">-- set status --</option>
+          <option value="enroute">Enroute</option>
+          <option value="onsite">Onsite</option>
+          <option value="completed">Completed</option>
+        </select>
+      </div>
+      <div style="margin-top:8px">
+        <textarea id="note_${it.id}" placeholder="Add a note (optional)"></textarea>
+      </div>
+      <div style="margin-top:8px">
+        <button class="btn btn-primary" onclick="updateAssignment(${it.id}, '${username}')">Save</button>
+      </div>
+    `;
+    container.appendChild(html);
+  });
+}
+async function updateAssignment(aid, username){
+  const sel = document.getElementById('select_' + aid);
+  const note = document.getElementById('note_' + aid).value;
+  const status = sel ? sel.value : '';
+  if(!status){ alert('select a status'); return; }
+  try{
+    const res = await fetch('/tech/update_assignment', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ assignment_id: aid, status: status, note: note, mark_lead_completed: status === 'completed' })
+    });
+    const j = await res.json();
+    if(j.ok){
+      document.getElementById('status_' + aid).innerText = status;
+      alert('Updated');
+    } else {
+      alert('Failed: ' + (j.error || 'unknown'));
+    }
+  }catch(e){
+    alert('Network error');
+  }
+}
+</script>
+</body>
+</html>
+"""
+        return html, 200, {"Content-Type": "text/html"}
+
+    # -------------------------------
+    # Run Flask in background
+    # -------------------------------
     def run_flask():
         try:
-            # choose port 5001 to avoid Streamlit port conflicts
             flask_app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
         except Exception:
             pass
 
-
-    # start flask in background daemon thread (only if not already started)
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 except Exception:
-    # if Flask isn't available (not installed) the API simply won't start — harmless
+    # Flask not installed or failed — harmless
     pass
 # ---------- END BLOCK F ----------
+
 
 
 
@@ -1535,6 +1934,12 @@ elif page == "AI Recommendations":
     page_ai_recommendations()
 elif page == "ML (internal)":
     page_ml_internal()
+elif page == "Tasks":
+    page_tasks()
+elif page == "Technician Mobile":
+    page_technician_mobile()
+elif page == "Technician Map Tracking":
+    page_technician_map()
 elif page == "Settings":
     page_settings()
 elif page == "Exports":
