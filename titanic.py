@@ -1360,8 +1360,10 @@ if inline_refresh:
 filter_choice = st.selectbox(
     "Filter technician",
     options=["All"] + get_technician_usernames(active_only=True),
-    index=0
+    index=0,
+    key="filter_tech_dropdown"   # UNIQUE KEY FIX
 )
+
 
 show_paths = st.checkbox("Show path history", value=False)
 show_heatmap = st.checkbox("Show heatmap (last 24h)", value=False)
