@@ -1485,9 +1485,6 @@ for _, lead in df_view.sort_values("created_at", ascending=False).head(200).iter
 # ---------- END PIPELINE LEADS LOOP ----------
 
 
-                    except Exception as e:
-                        st.error("Failed to assign: " + str(e))
-
 
 
 
