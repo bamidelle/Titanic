@@ -919,7 +919,12 @@ def page_dashboard():
     with q2:
         filter_src = st.selectbox("Source filter", options=["All"] + sorted(df["source"].dropna().unique().tolist()) if not df.empty else ["All"], key="dashboard_filter_src")
     with q3:
-        filter_stage = st.selectbox("Stage filter", options=["All"] + stages, key="dashboard_filter_stage")
+        filter_stage = st.selectbox(
+    "Stage filter",
+    options=["All"] + PIPELINE_STAGES,
+    key="dashboard_filter_stage"
+)
+
 
 
     df_view = df.copy()
