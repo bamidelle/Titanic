@@ -1073,88 +1073,110 @@ else:
             st.markdown("### Technician Assignment")
             techs_df = get_technicians_df(active_only=True)
             tech_options = [""] + (techs_df["username"].tolist() if not techs_df.empty else [])
-            selected_tech = st.selectbox("Assign Technician (active)", options=tech_options, index=0, key=f"tech_select_{lead['lead_id']}")
-            assign_notes = st.text_area("Assignment notes (optional)", value="", key=f"tech_notes_{lead['lead_id']}")
+            selected_tech = st.selectbox(
+                "Assign Technician (active)",
+                options=tech_options,
+                index=0,
+                key=f"tech_select_{lead['lead_id']}"
+            )
+            assign_notes = st.text_area(
+                "Assignment notes (optional)",
+                value="",
+                key=f"tech_notes_{lead['lead_id']}"
+            )
+
             if st.button(f"Assign Technician to {lead['lead_id']}", key=f"assign_btn_{lead['lead_id']}"):
                 if not selected_tech:
                     st.error("Select a technician")
                 else:
                     try:
-                        create_inspection_assignment(lead_id=lead["lead_id"], technician_username=selected_tech, notes=assign_notes)
+                        create_inspection_assignment(
+                            lead_id=lead["lead_id"],
+                            technician_username=selected_tech,
+                            notes=assign_notes
+                        )
                         upsert_lead_record({
                             "lead_id": lead["lead_id"],
                             "inspection_scheduled": True,
                             "stage": "Inspection Scheduled"
                         }, actor="admin")
+
                         st.success(f"Assigned {selected_tech} to lead {lead['lead_id']}")
                         st.rerun()
+
                     except Exception as e:
                         st.error("Failed to assign: " + str(e))
     # end for
+
+    # -----------------------------------------------------
+    # Technician Map Renderer
+    # -----------------------------------------------------
     def render_tech_map(zoom=11, show_lines=False):
-    tech_locs = get_latest_tech_locations()
+        tech_locs = get_latest_tech_locations()
 
         if not tech_locs:
             st.info("No technician locations yet.")
             return
 
-    df = pd.DataFrame(tech_locs)
+        df = pd.DataFrame(tech_locs)
 
-    center = [df["latitude"].mean(), df["longitude"].mean()]
+        # Map center
+        center = [df["latitude"].mean(), df["longitude"].mean()]
 
-    scatter = pdk.Layer(
-        "ScatterplotLayer",
-        df,
-        get_position=["longitude", "latitude"],
-        get_color=[0, 122, 255],
-        get_radius=50,
-        pickable=True,
-    )
+        scatter = pdk.Layer(
+            "ScatterplotLayer",
+            df,
+            get_position=["longitude", "latitude"],
+            get_color=[0, 122, 255],
+            get_radius=50,
+            pickable=True,
+        )
 
-    tooltip = {
-        "html": "<b>Tech:</b> {tech_username}<br/>"
-                "<b>Last Ping:</b> {timestamp}<br/>"
-                "<b>Lead:</b> {lead_id}<br/>"
-                "<b>Accuracy:</b> {accuracy}",
-        "style": {"color": "white"}
-    }
+        tooltip = {
+            "html": "<b>Tech:</b> {tech_username}<br/>"
+                    "<b>Last Ping:</b> {timestamp}<br/>"
+                    "<b>Lead:</b> {lead_id}<br/>"
+                    "<b>Accuracy:</b> {accuracy}",
+            "style": {"color": "white"}
+        }
 
-    layers = [scatter]
+        layers = [scatter]
 
-    if show_lines:
-        s = get_session()
-        try:
-            arcs = []
-            for r in tech_locs:
-                if r["lead_id"]:
-                    lp = (
-                        s.query(LocationPing)
-                        .filter(LocationPing.lead_id == r["lead_id"])
-                        .order_by(LocationPing.timestamp.desc())
-                        .first()
+        # Optional lines from tech → last ping for the same lead
+        if show_lines:
+            s = get_session()
+            try:
+                arcs = []
+                for r in tech_locs:
+                    if r["lead_id"]:
+                        lp = (
+                            s.query(LocationPing)
+                            .filter(LocationPing.lead_id == r["lead_id"])
+                            .order_by(LocationPing.timestamp.desc())
+                            .first()
+                        )
+                        if lp:
+                            arcs.append({
+                                "source_lon": r["longitude"],
+                                "source_lat": r["latitude"],
+                                "target_lon": float(lp.longitude),
+                                "target_lat": float(lp.latitude)
+                            })
+
+                if arcs:
+                    arc_df = pd.DataFrame(arcs)
+                    arc_layer = pdk.Layer(
+                        "ArcLayer",
+                        arc_df,
+                        get_source_position=["source_lon", "source_lat"],
+                        get_target_position=["target_lon", "target_lat"],
+                        get_width=4,
+                        get_tilt=15,
                     )
-                    if lp:
-                        arcs.append({
-                            "source_lon": r["longitude"],
-                            "source_lat": r["latitude"],
-                            "target_lon": float(lp.longitude),
-                            "target_lat": float(lp.latitude)
-                        })
+                    layers.append(arc_layer)
+            finally:
+                s.close()
 
-            if arcs:
-                arc_df = pd.DataFrame(arcs)
-                arc_layer = pdk.Layer(
-                    "ArcLayer",
-                    arc_df,
-                    get_source_position=["source_lon", "source_lat"],
-                    get_target_position=["target_lon", "target_lat"],
-                    get_width=4,
-                    get_tilt=15,
-                )
-                layers.append(arc_layer)
-
-        finally:
-            s.close()
 
     view_state = pdk.ViewState(
         latitude=float(center[0]),
