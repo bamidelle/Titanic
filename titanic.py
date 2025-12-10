@@ -1178,7 +1178,7 @@ else:
                 s.close()
 
 
-    view_state = pdk.ViewState(
+     view_state = pdk.ViewState(
         latitude=float(center[0]),
         longitude=float(center[1]),
         zoom=zoom,
@@ -1194,7 +1194,11 @@ else:
 
     st.pydeck_chart(deck, use_container_width=True)
 
-    def get_latest_tech_locations():
+
+# -----------------------------------------------------
+# Helper: Get latest technician locations
+# -----------------------------------------------------
+def get_latest_tech_locations():
     s = get_session()
     try:
         rows = (
@@ -1219,19 +1223,22 @@ else:
     finally:
         s.close()
 
-    def page_technician_map():
+
+# -----------------------------------------------------
+# Technician Map Page
+# -----------------------------------------------------
+def page_technician_map():
     st.markdown("<div class='header'>🗺️ Technician Map Tracking</div>", unsafe_allow_html=True)
     st.markdown("<em>Live technician locations — latest ping per tech. Use Auto-refresh to update every N seconds.</em>", unsafe_allow_html=True)
 
-    # Auto-refresh controls (meta refresh)
+    # Auto-refresh controls
     auto = st.checkbox("Enable auto-refresh (meta refresh)", value=False)
     if auto:
         secs = st.number_input("Refresh interval (seconds)", min_value=5, max_value=300, value=20, step=5)
-        # add a meta refresh tag (simple, reliable)
         st.markdown(f'<meta http-equiv="refresh" content="{secs}">', unsafe_allow_html=True)
 
     # Options
-    c1, c2 = st.columns([2,1])
+    c1, c2 = st.columns([2, 1])
     with c1:
         show_lines = st.checkbox("Show lines to assigned lead (if available)", value=False)
     with c2:
